@@ -148,10 +148,11 @@ class WorkerProfiler(ABC):
         return nullcontext()
 
 
-TorchProfilerActivity = Literal["CPU", "CUDA", "XPU"]
+TorchProfilerActivity = Literal["CPU", "CUDA", "PRIVATEUSE1", "XPU"]
 TorchProfilerActivityMap = {
     "CPU": torch.profiler.ProfilerActivity.CPU,
     "CUDA": torch.profiler.ProfilerActivity.CUDA,
+    "PRIVATEUSE1": torch.profiler.ProfilerActivity.PRIVATEUSE1,
     "XPU": torch.profiler.ProfilerActivity.XPU,
 }
 
