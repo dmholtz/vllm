@@ -196,7 +196,7 @@ class TorchProfilerWrapper(WorkerProfiler):
                 use_gzip=profiler_config.torch_profiler_use_gzip,
             )
 
-        self.dump_cpu_time_total = "CPU" in activities and len(activities) == 1
+        self.dump_cpu_time_total = "CPU" in activities
 
         # Create profiler schedule if warmup or wait iterations are configured
         profiler_schedule = None
