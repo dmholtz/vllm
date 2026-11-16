@@ -36,6 +36,7 @@ use tracing::{info, warn};
 
 use crate::middleware;
 use crate::routes::openai::utils::types::{ErrorDetail, ErrorResponse};
+use crate::serving_tasks::ServingTasks;
 use crate::state::AppState;
 
 const SCALE_OUT_DISABLED_MESSAGE: &str =
@@ -101,6 +102,44 @@ fn runtime_lora_updating_enabled() -> bool {
         .is_some_and(|value| matches!(value.trim().to_lowercase().as_str(), "1" | "true"))
 }
 
+/// Mount pooling routes like Python's `register_pooling_api_routers`.
+///
+/// Endpoints that Python serves for this model but the Rust frontend does not
+/// implement yet respond with 501 instead of 404.
+fn add_pooling_routes(
+    mut router: Router<Arc<AppState>>,
+    tasks: Option<&ServingTasks>,
+) -> Router<Arc<AppState>> {
+    let Some(tasks) = tasks else {
+        return router
+            .route("/v1/embeddings", post(openai::embeddings))
+            .route("/pooling", post(pooling::pooling))
+            .route("/classify", post(pooling::classify));
+    };
+    if tasks.serves_pooling() {
+        router = router.route("/pooling", post(pooling::pooling));
+    }
+    if tasks.serves_classify() {
+        router = router.route("/classify", post(pooling::classify));
+    }
+    if tasks.serves_token_embeddings() {
+        // TODO: implement token embeddings and late chunking.
+        router = router.route("/v1/embeddings", post(not_supported));
+    } else if tasks.serves_embeddings() {
+        router = router
+            .route("/v1/embeddings", post(openai::embeddings))
+            // TODO: implement the Cohere embed API.
+            .route("/v2/embed", post(not_supported));
+    }
+    if tasks.serves_scoring() {
+        // TODO: implement the scoring and reranking APIs.
+        for path in ["/score", "/v1/score", "/rerank", "/v1/rerank", "/v2/rerank"] {
+            router = router.route(path, post(not_supported));
+        }
+    }
+    router
+}
+
 /// Build the minimal OpenAI-compatible router for one configured model.
 pub fn build_router(state: Arc<AppState>) -> Router {
     let scale_out_endpoints_enabled = state.api_server_options.enable_scale_out;
@@ -140,6 +179,10 @@ fn build_router_with_options(
     runtime_lora_updating_enabled: bool,
     scale_out_endpoints_enabled: bool,
 ) -> Router {
+    // Without an engine handshake (e.g. unit-test states), mount every route.
+    let tasks = state.serving_tasks();
+    let serves_generate = tasks.is_none_or(|tasks| tasks.supports_generate());
+
     let mut router = Router::new()
         // Health & monitoring
         .route("/health", get(health::health))
@@ -149,39 +192,44 @@ fn build_router_with_options(
         .route("/kv_event_sources", get(kv_event_sources::kv_event_sources))
         // OpenAI-compatible endpoints
         .route("/v1/models", get(openai::list_models))
-        .route("/v1/completions", post(openai::completions))
-        .route("/v1/chat/completions", post(openai::chat_completions))
-        .route("/v1/embeddings", post(openai::embeddings))
-        .route("/pooling", post(pooling::pooling))
-        .route("/classify", post(pooling::classify))
-        // TODO: implement the Anthropic Messages API.
-        .route("/v1/messages", post(not_supported))
-        .route("/v1/messages/count_tokens", post(not_supported))
-        // TODO: implement batched chat completions.
-        .route("/v1/chat/completions/batch", post(not_supported))
         // TODO: implement the decisions APIs.
         .route("/v1/decisions", post(not_supported))
         .route("/v1/systemone", post(not_supported))
-        // TODO: implement elastic EP scaling.
-        .route("/scale_elastic_ep", post(not_supported))
-        .route("/is_scaling_elastic_ep", post(not_supported))
         // vLLM specific endpoints
         .route("/tokenize", post(tokenize::tokenize))
         .route("/detokenize", post(tokenize::detokenize));
 
-    if scale_out_endpoints_enabled {
-        router = router.route("/inference/v1/generate", post(inference::generate));
-        // TODO: implement the remaining scale-out routes.
-        for path in UNIMPLEMENTED_SCALE_OUT_ROUTES {
-            router = router.route(path, post(not_supported));
-        }
-    } else {
-        info!("{SCALE_OUT_DISABLED_MESSAGE}");
-        router = router.route("/inference/v1/generate", post(disabled_scale_out));
-        for path in UNIMPLEMENTED_SCALE_OUT_ROUTES {
-            router = router.route(path, post(disabled_scale_out));
+    // Generation routes are served only for models that support `generate`,
+    // like Python's `register_generate_api_routers`.
+    if serves_generate {
+        router = router
+            .route("/v1/completions", post(openai::completions))
+            .route("/v1/chat/completions", post(openai::chat_completions))
+            // TODO: implement the Anthropic Messages API.
+            .route("/v1/messages", post(not_supported))
+            .route("/v1/messages/count_tokens", post(not_supported))
+            // TODO: implement batched chat completions.
+            .route("/v1/chat/completions/batch", post(not_supported))
+            // TODO: implement elastic EP scaling.
+            .route("/scale_elastic_ep", post(not_supported))
+            .route("/is_scaling_elastic_ep", post(not_supported));
+
+        if scale_out_endpoints_enabled {
+            router = router.route("/inference/v1/generate", post(inference::generate));
+            // TODO: implement the remaining scale-out routes.
+            for path in UNIMPLEMENTED_SCALE_OUT_ROUTES {
+                router = router.route(path, post(not_supported));
+            }
+        } else {
+            info!("{SCALE_OUT_DISABLED_MESSAGE}");
+            router = router.route("/inference/v1/generate", post(disabled_scale_out));
+            for path in UNIMPLEMENTED_SCALE_OUT_ROUTES {
+                router = router.route(path, post(disabled_scale_out));
+            }
         }
     }
+
+    router = add_pooling_routes(router, tasks);
 
     if state.api_server_options.enable_tokenizer_info_endpoint {
         // TODO: implement `/tokenizer_info`.

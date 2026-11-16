@@ -51,7 +51,7 @@ use vllm_engine_core_client::test_utils::{
 use vllm_engine_core_client::{
     ENGINE_CORE_DEAD_SENTINEL, EngineCoreClient, EngineCoreClientConfig, EngineId,
 };
-use vllm_llm::{Llm, PoolingTask};
+use vllm_llm::{EngineTask, Llm, PoolingTask};
 use vllm_metrics::METRICS;
 use vllm_text::tokenizer::DynTokenizer;
 use vllm_text::{Prompt, TextBackend, TextLlm, TextRequestProcessor};
@@ -1519,6 +1519,80 @@ async fn unimplemented_python_routes_return_not_implemented() {
         ("POST", "/is_scaling_elastic_ep"),
     ] {
         assert_route_not_supported(&app, method, uri, uri).await;
+    }
+}
+
+async fn route_status(app: &axum::Router, uri: &str) -> StatusCode {
+    app.clone()
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .expect("build request"),
+        )
+        .await
+        .expect("call app")
+        .status()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn routes_are_gated_by_engine_tasks() {
+    use vllm_engine_core_client::protocol::pooling::PoolingFrontendConfig;
+
+    use crate::serving_tasks::ServingTasks;
+
+    let (chat, _engine_task) = test_models_with_engine_outputs_and_backend(
+        b"engine-route-gating",
+        default_stream_output_specs(),
+        Arc::new(FakeChatBackend::new()),
+    )
+    .await;
+    let state = AppState::new(vec!["model".to_string()], chat).with_serving_tasks(ServingTasks {
+        supported: vec![
+            EngineTask::Pooling(PoolingTask::Embed),
+            EngineTask::Pooling(PoolingTask::TokenEmbed),
+        ],
+        pooling: Some(PoolingFrontendConfig {
+            pooling_task: Some(PoolingTask::Embed),
+            ..Default::default()
+        }),
+    });
+    let app = build_router(Arc::new(state));
+
+    // Generation routes are not served for pooling models, like Python.
+    for uri in [
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/messages",
+        "/classify",
+    ] {
+        assert_eq!(
+            route_status(&app, uri).await,
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+    // Embedding routes are served; JSON validation runs before any engine I/O.
+    for uri in ["/v1/embeddings", "/pooling"] {
+        assert_eq!(
+            route_status(&app, uri).await,
+            StatusCode::BAD_REQUEST,
+            "{uri}"
+        );
+    }
+    // Endpoints Python serves for embedding models but Rust lacks are 501.
+    for uri in [
+        "/v2/embed",
+        "/score",
+        "/v1/score",
+        "/rerank",
+        "/v1/rerank",
+        "/v2/rerank",
+    ] {
+        assert_route_not_supported(&app, "POST", uri, uri).await;
     }
 }
 

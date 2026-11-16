@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+use crate::serving_tasks::ServingTasks;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -54,6 +55,9 @@ pub struct AppState {
     /// Profiler mode that registers `/start_profile` and `/stop_profile`
     /// routes when present.
     pub profiler: Option<String>,
+    /// Engine-reported tasks used to gate task-specific routes. `None` mounts
+    /// every route, for states built without an engine handshake.
+    serving_tasks: Option<ServingTasks>,
 }
 
 impl AppState {
@@ -82,7 +86,19 @@ impl AppState {
             model_path: None,
             request_runtime: OnceLock::new(),
             profiler: None,
+            serving_tasks: None,
         }
+    }
+
+    /// Set the engine-reported tasks used to gate task-specific routes.
+    pub fn with_serving_tasks(mut self, serving_tasks: ServingTasks) -> Self {
+        self.serving_tasks = Some(serving_tasks);
+        self
+    }
+
+    /// Return the engine-reported tasks, when discovered at startup.
+    pub fn serving_tasks(&self) -> Option<&ServingTasks> {
+        self.serving_tasks.as_ref()
     }
 
     /// Set HTTP/API-server behavior switches.

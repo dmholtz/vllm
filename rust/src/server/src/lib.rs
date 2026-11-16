@@ -13,6 +13,7 @@ mod render;
 mod routes;
 mod runtime;
 mod server_info;
+mod serving_tasks;
 mod state;
 mod tls;
 #[cfg(test)]
@@ -57,6 +58,7 @@ use vllm_text::TextLlm;
 use crate::listener::{Listener, MaybeTlsListener};
 use crate::routes::build_router;
 use crate::server_info::ServerInfoSnapshot;
+use crate::serving_tasks::ServingTasks;
 use crate::state::AppState;
 
 /// How often the server PINGs an idle gRPC connection to reap a dead peer;
@@ -145,8 +147,11 @@ async fn build_state(config: &Config) -> Result<Arc<AppState>> {
         .with_tool_strict_level(config.tool_strict_level)
         .with_exclude_tools_when_tool_choice_none(config.exclude_tools_when_tool_choice_none);
 
+    let serving_tasks = discover_serving_tasks(chat.text().engine_core_client()).await?;
+
     let state = Arc::new(
         AppState::new(served_model_names, chat)
+            .with_serving_tasks(serving_tasks)
             .with_model_path(config.model.clone())
             .with_api_server_options(config.api_server_options)
             .with_server_info(ServerInfoSnapshot::from_config(config))
@@ -160,6 +165,27 @@ async fn build_state(config: &Config) -> Result<Arc<AppState>> {
     load_static_loras(&state, &config.lora_modules).await?;
 
     Ok(state)
+}
+
+/// Discover the engine's supported tasks and resolved pooling settings, which
+/// decide the task-specific routes served, like Python's `build_app()`.
+async fn discover_serving_tasks(client: &EngineCoreClient) -> Result<ServingTasks> {
+    let supported = client
+        .get_supported_tasks()
+        .await
+        .context("failed to discover supported tasks")?
+        .to_vec();
+    let pooling = if supported.iter().any(|task| matches!(task, vllm_llm::EngineTask::Pooling(_))) {
+        client
+            .get_pooling_frontend_config()
+            .await
+            .context("failed to discover pooling configuration")?
+            .cloned()
+    } else {
+        None
+    };
+    info!(?supported, pooling_task = ?pooling.as_ref().and_then(|c| c.pooling_task), "discovered serving tasks");
+    Ok(ServingTasks { supported, pooling })
 }
 
 async fn load_static_loras(state: &AppState, modules: &[LoraModulePath]) -> Result<()> {
