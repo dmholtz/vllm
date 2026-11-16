@@ -20,6 +20,7 @@ use crate::error::{Error, Result, bail_invalid_client_config};
 use crate::protocol::dtype::ModelDtype;
 use crate::protocol::handshake::EngineCoreReadyResponse;
 use crate::protocol::lora::LoraRequest;
+use crate::protocol::pooling::PoolingFrontendConfig;
 use crate::protocol::request::{EngineCoreRequest, EngineCoreRequestType};
 use crate::protocol::task::EngineTask;
 use crate::protocol::utility::{EngineCoreUtilityRequest, PauseMode};
@@ -283,6 +284,7 @@ pub struct EngineCoreClient {
     output_address: String,
     engines: Vec<ConnectedEngine>,
     supported_tasks: OnceCell<Box<[EngineTask]>>,
+    pooling_frontend_config: OnceCell<Option<PoolingFrontendConfig>>,
     inner: Arc<ClientInner>,
     coordinator: Option<CoordinatorHandle>,
     abort_tx: mpsc::UnboundedSender<AbortRequest>,
@@ -435,6 +437,7 @@ impl EngineCoreClient {
             output_address: connected.output_address,
             engines,
             supported_tasks: OnceCell::new(),
+            pooling_frontend_config: OnceCell::new(),
             inner,
             coordinator,
             abort_tx,
@@ -486,6 +489,25 @@ impl EngineCoreClient {
                 )
             })
             .await?)
+    }
+
+    /// Return the model's resolved pooling settings, or `None` for models
+    /// without a pooler.
+    ///
+    /// The first call queries EngineCore's `get_pooling_frontend_config`
+    /// utility; later calls reuse the cached result.
+    pub async fn get_pooling_frontend_config(&self) -> Result<Option<&PoolingFrontendConfig>> {
+        Ok(self
+            .pooling_frontend_config
+            .get_or_try_init(|| async {
+                self.call_utility_consensus::<Option<PoolingFrontendConfig>, _>(
+                    "get_pooling_frontend_config",
+                    (),
+                )
+                .await
+            })
+            .await?
+            .as_ref())
     }
 
     #[cfg(test)]
@@ -655,7 +677,13 @@ impl EngineCoreClient {
 
         let request_id = req.request_id.clone();
         let lora_name = req.lora_request.as_ref().map(|lora| lora.lora_name.clone());
-        let data_parallel_rank = req.data_parallel_rank;
+        // Pin late-interaction requests sharing a query key to one engine, as
+        // their query embeddings are cached in worker-local memory.
+        let data_parallel_rank = req.data_parallel_rank.or_else(|| {
+            (req.pooling_params.as_ref())
+                .and_then(|params| params.late_interaction_query_key())
+                .and_then(|key| self.inner.affinity_engine_rank(key))
+        });
         let stream_interval = (req.sampling_params.as_ref())
             .and_then(|params| params.stream_interval)
             .unwrap_or(NonZeroU32::MIN);

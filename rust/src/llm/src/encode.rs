@@ -5,9 +5,12 @@ use std::collections::BTreeMap;
 
 use futures::StreamExt as _;
 use vllm_engine_core_client::EngineCoreOutputStream;
+use vllm_engine_core_client::protocol::OpaqueValue;
 use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_engine_core_client::protocol::output::EngineCoreFinishReason;
-use vllm_engine_core_client::protocol::pooling::EngineCorePoolingParams;
+use vllm_engine_core_client::protocol::pooling::{
+    EngineCorePoolingParams, LateChunkingParams, LateInteractionParams,
+};
 use vllm_engine_core_client::protocol::request::EngineCoreRequest;
 use vllm_engine_core_client::protocol::task::PoolingTask;
 use vllm_engine_core_client::protocol::tensor::WireTensor;
@@ -38,6 +41,13 @@ pub struct PoolingParams {
     /// such as the token IDs of `good_token` and `bad_token` in the
     /// `math-shepherd-mistral-7b-prm` model.
     pub returned_token_ids: Option<Vec<u32>>,
+    /// Internal: late-interaction scoring metadata. Requests sharing a query
+    /// key are routed to the same data-parallel engine.
+    pub late_interaction_params: Option<LateInteractionParams>,
+    /// Internal: model-specific keyword arguments forwarded to the pooler.
+    pub extra_kwargs: Option<BTreeMap<String, OpaqueValue>>,
+    /// Mean-pool contextual tokens into fixed-size chunks for `token_embed`.
+    pub late_chunking_params: Option<LateChunkingParams>,
 }
 
 impl PoolingParams {
@@ -48,6 +58,10 @@ impl PoolingParams {
             step_tag_id: self.step_tag_id,
             returned_token_ids: self.returned_token_ids,
             task,
+            late_interaction_params: self.late_interaction_params,
+            extra_kwargs: self.extra_kwargs,
+            late_chunking_params: self.late_chunking_params,
+            ..Default::default()
         }
     }
 }
@@ -282,6 +296,7 @@ mod tests {
                 dimensions: Some(128),
                 step_tag_id: None,
                 returned_token_ids: None,
+                ..Default::default()
             },
             arrival_time: Some(42.5),
             cache_salt: Some("salt".to_string()),
@@ -312,6 +327,7 @@ mod tests {
                 step_tag_id: None,
                 returned_token_ids: None,
                 task: PoolingTask::Embed,
+                ..Default::default()
             })
         );
         assert_eq!(request.arrival_time, 42.5);

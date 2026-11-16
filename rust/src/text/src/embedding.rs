@@ -166,6 +166,7 @@ impl TextRequestProcessor {
                 dimensions: request.params.dimensions,
                 step_tag_id: None,
                 returned_token_ids: None,
+                ..Default::default()
             },
             arrival_time: request.arrival_time,
             cache_salt: request.cache_salt,
@@ -260,6 +261,9 @@ mod tests {
                     dimensions: None,
                     step_tag_id: None,
                     returned_token_ids: None,
+                    late_interaction_params: None,
+                    extra_kwargs: None,
+                    late_chunking_params: None,
                 },
                 arrival_time: Some(
                     42.5,

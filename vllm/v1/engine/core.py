@@ -435,6 +435,41 @@ class EngineCore:
         self._log_pooler_config(supported_tasks)
         return supported_tasks
 
+    def get_pooling_frontend_config(self) -> dict[str, Any] | None:
+        """Model-dependent pooling settings needed by out-of-process frontends.
+
+        Frontends that do not share the Python `ModelConfig` (e.g. the Rust
+        frontend) use this to mirror the Python pooling entrypoints: which
+        routes to expose, how to tokenize, and how to post-process outputs.
+        Returns `None` for models without a pooler.
+        """
+        model_config = self.vllm_config.model_config
+        pooler_config = model_config.pooler_config
+        if pooler_config is None:
+            return None
+
+        supported_tasks = self.get_supported_tasks()
+        hf_config = model_config.hf_config
+        encoder_config = model_config.encoder_config or {}
+        id2label = getattr(hf_config, "id2label", None) or {}
+        return {
+            "pooling_task": model_config.get_pooling_task(supported_tasks),
+            "enable_chunked_processing": bool(pooler_config.enable_chunked_processing),
+            "max_embed_len": pooler_config.max_embed_len,
+            "enable_flash_late_interaction": bool(
+                pooler_config.enable_flash_late_interaction
+            ),
+            "num_labels": getattr(hf_config, "num_labels", None),
+            "id2label": {str(k): str(v) for k, v in id2label.items()},
+            "use_sep_token": bool(model_config.use_sep_token),
+            "architecture": model_config.architecture,
+            "do_lower_case": bool(encoder_config.get("do_lower_case", False)),
+            "is_matryoshka": bool(model_config.is_matryoshka),
+            "matryoshka_dimensions": model_config.matryoshka_dimensions,
+            "embedding_size": model_config.embedding_size,
+            "is_multimodal_model": bool(model_config.is_multimodal_model),
+        }
+
     def _log_pooler_config(self, supported_tasks: tuple[SupportedTask, ...]) -> None:
         if self._pooler_config_logged:
             return

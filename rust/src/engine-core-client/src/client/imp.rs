@@ -123,6 +123,12 @@ impl ClientInner {
         registry.register(request_id, lora_name, data_parallel_rank, stream_interval)
     }
 
+    /// Return the engine rank owning a late-interaction query key; see
+    /// [`RequestRegistry::affinity_engine_rank`].
+    pub fn affinity_engine_rank(&self, key: &str) -> Option<u32> {
+        self.request_reg.lock().affinity_engine_rank(key)
+    }
+
     /// Allocate the next utility `call_id` and register its waiting receiver.
     pub fn allocate_and_register_utility_call(&self) -> Result<(u64, UtilityReceiver)> {
         let mut registry = self.utility_reg.lock();

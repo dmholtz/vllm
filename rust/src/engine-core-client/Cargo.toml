@@ -8,6 +8,7 @@ license.workspace = true
 test-util = ["dep:tempfile"]
 
 [dependencies]
+crc32fast.workspace = true
 arc-swap.workspace = true
 bytemuck.workspace = true
 byteorder.workspace = true

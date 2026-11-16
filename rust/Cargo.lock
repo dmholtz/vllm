@@ -5704,6 +5704,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "clap",
+ "crc32fast",
  "easy-ext",
  "enum-as-inner",
  "expect-test",

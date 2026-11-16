@@ -198,6 +198,25 @@ impl RequestRegistry {
         Ok((engine_id, rx))
     }
 
+    /// Pick the engine rank that owns a late-interaction query key, mirroring
+    /// Python `get_late_interaction_engine_index`: `crc32(key) % num_engines`
+    /// over this client's engines in rank order. Query embeddings are cached in
+    /// worker-local memory, so every request sharing a key must reach the same
+    /// engine.
+    pub fn affinity_engine_rank(&self, key: &str) -> Option<u32> {
+        let mut ranks = self
+            .routing_per_engine
+            .keys()
+            .filter_map(EngineId::engine_index)
+            .collect::<Vec<_>>();
+        if ranks.is_empty() {
+            return None;
+        }
+        ranks.sort_unstable();
+        let index = crc32fast::hash(key.as_bytes()) as usize % ranks.len();
+        Some(ranks[index])
+    }
+
     fn choose_engine_for_request(&mut self, data_parallel_rank: Option<u32>) -> Result<EngineId> {
         if let Some(rank) = data_parallel_rank {
             let engine_id = u16::try_from(rank).ok().map(EngineId::from_engine_index);
@@ -1170,6 +1189,21 @@ mod tests {
                 state.routing_score()
             )
         ));
+    }
+
+    #[test]
+    fn affinity_engine_rank_matches_python_crc32() {
+        let engines = (0..3).map(EngineId::from_engine_index).collect::<Vec<_>>();
+        let mut registry = RequestRegistry::new(
+            &engines.iter().cloned().map(connected_engine).collect::<Vec<_>>(),
+        );
+        // Python: zlib.crc32(b"query-key") % 3 == 0; zlib.crc32(b"q") % 3 == 2.
+        assert_eq!(registry.affinity_engine_rank("query-key"), Some(0));
+        assert_eq!(registry.affinity_engine_rank("q"), Some(2));
+        let rank = registry.affinity_engine_rank("q");
+        let (chosen, _) =
+            registry.register("req".to_string(), None, rank, NonZeroU32::MIN).unwrap();
+        assert_eq!(chosen, engines[2]);
     }
 
     #[test]

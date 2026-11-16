@@ -36,6 +36,7 @@ fn sample_request() -> EncodeRequest {
             dimensions: Some(2),
             step_tag_id: None,
             returned_token_ids: None,
+            ..Default::default()
         },
         arrival_time: Some(42.5),
         cache_salt: None,
