@@ -100,6 +100,7 @@ impl HfSpecialTokens {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct ModelConfig {
+    pub(super) id2label: std::collections::BTreeMap<usize, String>,
     model_type: Option<String>,
     vocab_size: Option<u32>,
     eos_token_id: Option<OneOrManyTokenIds>,
