@@ -150,6 +150,7 @@ fn build_router_with_options(
         .route("/v1/models", get(openai::list_models))
         .route("/v1/completions", post(openai::completions))
         .route("/v1/chat/completions", post(openai::chat_completions))
+        .route("/v1/embeddings", post(openai::embeddings))
         // TODO: implement the Anthropic Messages API.
         .route("/v1/messages", post(not_supported))
         .route("/v1/messages/count_tokens", post(not_supported))

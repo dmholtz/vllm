@@ -5,6 +5,7 @@ use thiserror::Error;
 use vllm_engine_core_client::Error as EngineCoreError;
 use vllm_llm::Error as LlmError;
 
+use crate::embedding::EmbeddingError;
 pub use crate::lower::logprobs::LogprobsError;
 pub use crate::lower::sampling::SamplingParamsError;
 pub use crate::lower::token_ids::TokenIdsError;
@@ -40,6 +41,8 @@ pub enum Error {
     TokenIds(#[from] TokenIdsError),
     #[error(transparent)]
     SamplingParams(#[from] SamplingParamsError),
+    #[error(transparent)]
+    Embedding(#[from] EmbeddingError),
     #[error(
         "`min_tokens` must be less than or equal to `max_tokens`, \
          got min_tokens={min_tokens}, max_tokens={max_tokens}"
@@ -72,6 +75,7 @@ impl Error {
     /// Whether this error represents invalid user request parameters.
     pub fn is_request_validation_error(&self) -> bool {
         match self {
+            Self::Embedding(error) => error.is_request_validation_error(),
             Self::PromptTooLong { .. }
             | Self::PromptFillsContext { .. }
             | Self::EmptyPromptTokenIds { .. }
@@ -88,7 +92,9 @@ impl Error {
             | Self::InvalidRepetitionDetection { .. }
             // An empty tokenized prompt detected later, at request prepare
             // time, surfaces through the transparent Llm wrapper.
-            | Self::Llm(LlmError::EmptyPromptTokenIds { .. })
+            | Self::Llm(
+                LlmError::EmptyPromptTokenIds { .. } | LlmError::UnsupportedTask { .. },
+            )
             | Self::Llm(LlmError::EngineCoreClient(
                 EngineCoreError::InvalidDataParallelRank { .. },
             ))
