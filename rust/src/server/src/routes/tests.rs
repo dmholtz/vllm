@@ -1228,7 +1228,7 @@ async fn pooling_rejects_invalid_inputs_before_submitting_any_batch_member() {
             "/pooling",
             json!({"input": "x", "task": "classify"}),
             vec!["embed"],
-            "Unsupported task: 'classify' Supported tasks: ('embed',)",
+            "Unsupported task: 'classify' Supported tasks: ['embed']",
         ),
         (
             "/pooling",

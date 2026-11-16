@@ -12,7 +12,7 @@ mod lora;
 mod metrics;
 pub(crate) mod openai;
 mod pause;
-mod pooling;
+pub(crate) mod pooling;
 pub(crate) mod pooling_chat;
 pub(crate) mod pooling_encoding;
 mod profile;

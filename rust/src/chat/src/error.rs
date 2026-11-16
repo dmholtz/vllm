@@ -13,7 +13,11 @@ pub enum Error {
     EmptyMessages,
     #[error("cannot continue the final message when the last message is not from the assistant")]
     ContinueFinalAssistantWithoutFinalAssistant,
-    #[error("chat template is required but none was configured")]
+    /// Python raises this from `resolve_chat_template` as a client error.
+    #[error(
+        "As of transformers v4.44, default chat template is no longer allowed, so you must \
+         provide a chat template if the tokenizer does not define one."
+    )]
     MissingChatTemplate,
     #[error("chat template error: {0}")]
     ChatTemplate(String),
@@ -114,6 +118,7 @@ impl Error {
     pub fn is_request_validation_error(&self) -> bool {
         match self {
             Self::ChatTemplateThrown { .. }
+            | Self::MissingChatTemplate
             | Self::InvalidReasoningEffort(_)
             | Self::InvalidReasoningControl { .. }
             | Self::DuplicateToolName { .. }

@@ -74,6 +74,22 @@ struct PreparedRequest {
     requests: Vec<TextEncodeRequest>,
 }
 
+/// Python `PoolingBaseServing._validate_request`, which runs before
+/// tokenization for every pooling endpoint.
+pub(crate) fn check_truncation_limit(
+    truncate_prompt_tokens: Option<i64>,
+    max_model_len: u32,
+) -> Result<(), ApiError> {
+    if truncate_prompt_tokens.is_some_and(|value| value > i64::from(max_model_len)) {
+        bail_invalid_request!(
+            param = "truncate_prompt_tokens",
+            "truncate_prompt_tokens value is greater than max_model_len. Please request a \
+             smaller truncation size."
+        );
+    }
+    Ok(())
+}
+
 /// Wire literal of a task, as Python prints it in error messages.
 fn task_literal(task: impl serde::Serialize) -> String {
     serde_json::to_value(task)
@@ -132,18 +148,15 @@ async fn resolve_task(
                         task_literal(task)
                     );
                 }
-                // Python formats the supported tasks as a tuple repr.
-                let mut supported_repr = supported
+                // Python formats the supported tasks as a list repr.
+                let supported_repr = supported
                     .iter()
                     .map(|task| format!("'{}'", task_literal(task)))
                     .collect::<Vec<_>>()
                     .join(", ");
-                if supported.len() == 1 {
-                    supported_repr.push(',');
-                }
                 bail_invalid_request!(
                     param = "task",
-                    "Unsupported task: '{}' Supported tasks: ({supported_repr})",
+                    "Unsupported task: '{}' Supported tasks: [{supported_repr}]",
                     task_literal(task),
                 );
             }
@@ -174,6 +187,8 @@ async fn prepare_request(
     endpoint: Endpoint,
 ) -> Result<PreparedRequest, ApiError> {
     body.validate_options()?;
+    let max_model_len = state.chat.text().request_processor().max_model_len();
+    check_truncation_limit(body.truncate_prompt_tokens, max_model_len)?;
     let model = body.model.as_deref().filter(|model| !model.is_empty());
     let resolution = state.resolve_model_with_loras(model).await;
     if let Some(model) = model
@@ -206,7 +221,6 @@ async fn prepare_request(
     }
 
     // Python `FixedMaxLenTokenizeParamsMixin`: limited to `max_model_len`.
-    let max_model_len = state.chat.text().request_processor().max_model_len();
     let tokenization = PoolingTokenization {
         truncate_prompt_tokens: body.truncate_prompt_tokens,
         truncation_side: body.truncation_side,

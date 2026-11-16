@@ -22,6 +22,7 @@ use self::types::{
 };
 use super::utils::validated_json::ValidatedJson;
 use crate::error::{ApiError, bail_invalid_request, server_error, text_submit_error};
+use crate::routes::pooling::check_truncation_limit;
 use crate::routes::pooling_chat::render_conversations;
 use crate::routes::pooling_encoding::{
     BinaryItem, BinaryResponseInfo, EncodingFormat, PoolingUsage, binary_response, encode_base64,
@@ -74,6 +75,7 @@ async fn create_embedding(
         .unwrap_or_default();
     let text = state.chat.text();
     let max_model_len = text.request_processor().max_model_len();
+    check_truncation_limit(body.truncate_prompt_tokens, max_model_len)?;
     let is_chat = body.is_chat();
     let tokenization = embedding_tokenization(&body, &config, max_model_len, is_chat);
 
