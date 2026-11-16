@@ -5,9 +5,11 @@ use std::num::NonZeroU32;
 use std::time::Duration;
 
 use tracing::Span;
-use vllm_engine_core_client::EngineCoreClient;
+use vllm_engine_core_client::protocol::request::EngineCoreRequest;
+use vllm_engine_core_client::{EngineCoreClient, EngineCoreOutputStream};
 use vllm_metrics::METRICS;
 
+mod encode;
 mod error;
 mod inflight;
 mod log_stats;
@@ -15,6 +17,7 @@ mod output;
 mod request;
 mod request_metrics;
 
+pub use encode::{EncodeOutput, EncodeRequest, PoolingOutput, PoolingParams};
 pub use error::{Error, Result};
 pub use output::{
     CollectedGenerateOutput, FinishReason, GenerateOutput, GenerateOutputStream,
@@ -23,12 +26,13 @@ pub use output::{
 pub use request::GenerateRequest;
 pub use request_metrics::{RequestTimestamps, current_unix_timestamp_secs};
 pub use vllm_engine_core_client::protocol::logprobs::{Logprobs, PositionLogprobs, TokenLogprob};
+pub use vllm_engine_core_client::protocol::task::{EngineTask, GenerationTask, PoolingTask};
 
-use crate::inflight::InflightRequests;
+use crate::inflight::{InflightRequests, RequestGuard};
 use crate::log_stats::StatsLogger;
 use crate::request_metrics::RequestMetricsTracker;
 
-/// Thin generate-and-abort facade over [`EngineCoreClient`].
+/// Token-level generation, pooling, and abort facade over [`EngineCoreClient`].
 ///
 /// This mirrors the narrow public shape of Python `AsyncLLM.generate()` and
 /// `abort()`, but keeps the boundary close to raw engine-core requests and
@@ -44,6 +48,36 @@ pub struct Llm {
 }
 
 impl Llm {
+    async fn validate_task(&self, task: impl Into<EngineTask>) -> Result<()> {
+        let requested_task = task.into();
+        let supported_tasks = self.client.get_supported_tasks().await?;
+        if supported_tasks.contains(&requested_task) {
+            return Ok(());
+        }
+
+        Err(Error::UnsupportedTask {
+            model_name: self.client.model_name().to_string(),
+            requested_task,
+            supported_tasks: supported_tasks.to_vec(),
+        })
+    }
+
+    async fn submit(
+        &self,
+        engine_request: EngineCoreRequest,
+    ) -> Result<(EngineCoreOutputStream, RequestGuard)> {
+        let external_request_id = engine_request
+            .external_req_id
+            .clone()
+            .expect("prepared requests always set external_req_id");
+        let internal_request_id = engine_request.request_id.clone();
+        Span::current().record("engine_request_id", &internal_request_id);
+
+        let stream = self.client.call(engine_request).await?;
+        let guard = self.inflight.track(external_request_id, internal_request_id);
+        Ok((stream, guard))
+    }
+
     /// Create a new minimal LLM facade from an already connected engine-core
     /// client.
     pub fn new(client: EngineCoreClient) -> Self {
@@ -106,22 +140,12 @@ impl Llm {
         let prepared = req.prepare(self.randomize_request_id)?;
         let remote_prefill_cached_tokens = prepared.remote_prefill_cached_tokens();
         let prompt_token_ids = prepared.prompt_token_ids().into();
-        let external_request_id = prepared
-            .engine_request
-            .external_req_id
-            .clone()
-            .expect("prepare always sets external_req_id");
-        let internal_request_id = prepared.engine_request.request_id.clone();
-
-        // Record internal engine-core request ID in the current tracing span.
-        Span::current().record("engine_request_id", &internal_request_id);
-
         let arrival_time = prepared.engine_request.arrival_time;
         let max_tokens_param =
             (prepared.engine_request.sampling_params.as_ref()).map(|p| p.max_tokens);
         let prompt_len = prepared.prompt_token_ids().len() as u32;
 
-        let stream = self.client.call(prepared.engine_request).await?;
+        let (stream, guard) = self.submit(prepared.engine_request).await?;
 
         let request_metrics = RequestMetricsTracker::new(
             self.client.model_name().to_string(),
@@ -132,8 +156,6 @@ impl Llm {
             1,
             self.client.engine_stats_enabled(),
         );
-        let guard = self.inflight.track(external_request_id, internal_request_id);
-
         Ok(GenerateOutputStream::new(
             prompt_token_ids,
             remote_prefill_cached_tokens,
@@ -141,6 +163,28 @@ impl Llm {
             request_metrics,
             guard,
         ))
+    }
+
+    /// Submit one tokenized pooling request and collect its final output.
+    pub async fn encode(&self, req: EncodeRequest) -> Result<EncodeOutput> {
+        let task = req.task;
+        let prepared = req.prepare(self.randomize_request_id)?;
+        let prompt_token_ids = prepared.prompt_token_ids().to_vec();
+        let arrival_time = prepared.engine_request.arrival_time;
+        let prompt_len = prepared.prompt_token_ids().len() as u32;
+
+        self.validate_task(task).await?;
+        let (stream, _guard) = self.submit(prepared.engine_request).await?;
+        let request_metrics = RequestMetricsTracker::new(
+            self.client.model_name().to_string(),
+            stream.engine_index(),
+            arrival_time,
+            prompt_len,
+            None,
+            1,
+            self.client.engine_stats_enabled(),
+        );
+        encode::collect_encode_output(prompt_token_ids, stream, request_metrics).await
     }
 
     /// Abort in-flight requests by their external (user-supplied) request ids.

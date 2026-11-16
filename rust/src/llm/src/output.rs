@@ -105,6 +105,20 @@ pub enum FinishReason {
 }
 
 impl FinishReason {
+    pub(crate) fn from_engine(
+        finish_reason: EngineCoreFinishReason,
+        stop_reason: Option<StopReason>,
+        error: Option<Box<RequestError>>,
+    ) -> Self {
+        match finish_reason {
+            EngineCoreFinishReason::Stop => Self::Stop(stop_reason),
+            EngineCoreFinishReason::Length => Self::Length,
+            EngineCoreFinishReason::Abort => Self::Abort,
+            EngineCoreFinishReason::Error => Self::Error(error),
+            EngineCoreFinishReason::Repetition => Self::Repetition(stop_reason),
+        }
+    }
+
     /// Construct a stop finish reason caused by EOS rather than an explicit
     /// stop string/token.
     pub fn stop_eos() -> Self {
@@ -142,20 +156,6 @@ impl FinishReason {
             _ => None,
         }
     }
-}
-
-fn finish_reason_from_engine(
-    finish_reason: Option<EngineCoreFinishReason>,
-    stop_reason: Option<StopReason>,
-    error: Option<Box<RequestError>>,
-) -> Option<FinishReason> {
-    finish_reason.map(|reason| match reason {
-        EngineCoreFinishReason::Stop => FinishReason::Stop(stop_reason),
-        EngineCoreFinishReason::Length => FinishReason::Length,
-        EngineCoreFinishReason::Abort => FinishReason::Abort,
-        EngineCoreFinishReason::Error => FinishReason::Error(error),
-        EngineCoreFinishReason::Repetition => FinishReason::Repetition(stop_reason),
-    })
 }
 
 /// Token and logprob output item returned by [`GenerateOutputStream`].
@@ -407,8 +407,9 @@ impl GenerateOutputStream {
 
         // An engine error means the request was rejected before it ran.
         let rejected = raw.error.is_some();
-        let finish_reason =
-            finish_reason_from_engine(raw.finish_reason, raw.stop_reason, raw.error);
+        let finish_reason = raw
+            .finish_reason
+            .map(|reason| FinishReason::from_engine(reason, raw.stop_reason, raw.error));
         if let Some(finish_reason) = finish_reason.as_ref()
             && !rejected
         {

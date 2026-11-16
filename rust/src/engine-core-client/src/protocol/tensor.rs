@@ -188,6 +188,26 @@ impl<Dtype: From<TensorDtype> + Serialize + DeserializeOwned> WireArray<Dtype> {
     }
 }
 
+fn decode_chunks<const N: usize, T>(
+    data: &[u8],
+    numel: usize,
+    decode: impl Fn([u8; N]) -> T,
+) -> Result<Vec<T>, String> {
+    let expected_len = numel
+        .checked_mul(N)
+        .ok_or_else(|| "tensor byte length overflows usize".to_string())?;
+    if data.len() != expected_len {
+        return Err(format!(
+            "tensor data length {} does not match expected byte length {expected_len}",
+            data.len()
+        ));
+    }
+    Ok(data
+        .chunks_exact(N)
+        .map(|chunk| decode(chunk.try_into().expect("chunks_exact ensures length")))
+        .collect())
+}
+
 /// Validate that the number of elements implied by the shape matches the length
 /// of the data.
 fn validate_element_count(shape: &[usize], len: usize) -> Result<(), String> {
@@ -230,6 +250,32 @@ pub enum WireArrayData {
 }
 
 impl WireTensor {
+    /// Decode a floating-point tensor into float32 values.
+    pub fn to_f32_vec(&self) -> Result<Vec<f32>, String> {
+        let data = self
+            .data
+            .as_raw_view()
+            .ok_or_else(|| "tensor auxiliary frame was not resolved".to_string())?;
+        let numel = self
+            .shape
+            .checked_numel()
+            .ok_or_else(|| format!("tensor shape product overflows usize: {:?}", self.shape))?;
+
+        match self.dtype {
+            TensorDtype::F32 => decode_chunks(data, numel, f32::from_ne_bytes),
+            TensorDtype::F16 => {
+                decode_chunks(data, numel, |bytes| f16::from_ne_bytes(bytes).to_f32())
+            }
+            TensorDtype::Bf16 => {
+                decode_chunks(data, numel, |bytes| bf16::from_ne_bytes(bytes).to_f32())
+            }
+            dtype => Err(format!(
+                "unsupported pooling output dtype {:?}",
+                dtype.as_str()
+            )),
+        }
+    }
+
     /// Validate the shape and storage of an inline tensor.
     pub fn validate_inline(&self) -> Result<(), String> {
         let expected = self
@@ -409,6 +455,21 @@ mod tests {
     fn constructors_validate_shape_product() {
         let err = WireTensor::from_f32(vec![2, 2], vec![1.0, 2.0]).unwrap_err();
         assert!(err.contains("does not match shape"));
+    }
+
+    #[test]
+    fn floating_point_tensors_decode_to_f32() {
+        let f32_tensor = WireTensor::from_f32(vec![2], vec![1.0, -2.5]).unwrap();
+        assert_eq!(f32_tensor.to_f32_vec().unwrap(), vec![1.0, -2.5]);
+
+        let f16_tensor =
+            WireTensor::from_f16(vec![2], vec![f16::from_f32(1.0), f16::from_f32(-2.5)]).unwrap();
+        assert_eq!(f16_tensor.to_f32_vec().unwrap(), vec![1.0, -2.5]);
+
+        let bf16_tensor =
+            WireTensor::from_bf16(vec![2], vec![bf16::from_f32(1.0), bf16::from_f32(-2.5)])
+                .unwrap();
+        assert_eq!(bf16_tensor.to_f32_vec().unwrap(), vec![1.0, -2.5]);
     }
 
     #[test]
