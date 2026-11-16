@@ -8,7 +8,10 @@ use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_llm::{EncodeOutput, EncodeRequest, PoolingParams as LlmPoolingParams, PoolingTask};
 
 use crate::error::{Error, Result};
-use crate::{Prompt, PromptTruncation, TextEncodeRequest, TextLlm, TextRequestProcessor};
+use crate::{
+    PoolingTokenization, Prompt, PromptTruncation, PromptTruncationLimit, TextEncodeRequest,
+    TextLlm, TextRequestProcessor,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum EmbeddingError {
@@ -158,8 +161,16 @@ impl TextRequestProcessor {
         self.prepare_encode(TextEncodeRequest {
             request_id: request.request_id,
             prompt: request.prompt,
-            add_special_tokens: request.add_special_tokens,
-            prompt_truncation: request.prompt_truncation,
+            tokenization: PoolingTokenization {
+                truncate_prompt_tokens: request.prompt_truncation.map(
+                    |truncation| match truncation.limit {
+                        PromptTruncationLimit::InputBudget => -1,
+                        PromptTruncationLimit::Fixed(limit) => limit as i64,
+                    },
+                ),
+                truncation_side: request.prompt_truncation.map(|truncation| truncation.side),
+                ..PoolingTokenization::new(Some(self.max_model_len()), request.add_special_tokens)
+            },
             task: PoolingTask::Embed,
             pooling_params: LlmPoolingParams {
                 use_activation: request.params.use_activation,
@@ -355,7 +366,7 @@ mod tests {
 
         expect![[r#"
             [
-                "This model's maximum context length is 4 tokens. However, your prompt contains 5 input tokens, which exceeds this limit even without any output tokens. Please reduce the length of the input prompt.",
+                "This model's maximum context length is 4 tokens. However, your prompt contains at least 5 input tokens, which exceeds this limit even without any output tokens. Please reduce the length of the input prompt.",
                 "truncate_prompt_tokens=5 cannot be greater than max_model_len = 4. Please request a smaller truncation size.",
             ]
         "#]]

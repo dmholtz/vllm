@@ -25,7 +25,8 @@ pub use output::{
     DecodedText, DecodedTextEvent, DecodedTokenLogprob, Finished, SampledDelta, TextDecodeOptions,
     TextOutputStreamExt, TokenAnchor, TokenAttribution,
 };
-pub use request::{Prompt, SamplingParams, TextRequest, normalize_top_k};
+pub use pooling_tokenize::PoolingTokenization;
+pub use request::{Prompt, SamplingParams, TextRequest, is_valid_cache_salt, normalize_top_k};
 use trait_set::trait_set;
 use vllm_engine_core_client::EngineCoreClient;
 use vllm_engine_core_client::protocol::structured_outputs::StructuredOutputBackend;
@@ -39,6 +40,7 @@ mod encode;
 mod error;
 mod lower;
 pub mod output;
+mod pooling_tokenize;
 mod request;
 mod truncation;
 pub use truncation::{PromptTruncation, PromptTruncationLimit, TruncationSide};

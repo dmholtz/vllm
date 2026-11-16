@@ -3,11 +3,11 @@
 
 use std::collections::BTreeMap;
 
-use futures::{StreamExt as _, TryStreamExt as _, stream};
+use futures::future::try_join_all;
 use vllm_engine_core_client::protocol::lora::LoraRequest;
 use vllm_llm::{EncodeOutput, EncodeRequest, EngineTask, PoolingParams, PoolingTask};
 
-use crate::{Prompt, PromptTruncation, Result, TextLlm, TextRequestProcessor};
+use crate::{PoolingTokenization, Prompt, Result, TextLlm, TextRequestProcessor};
 
 /// Text input and tokenization options for a pooling request.
 #[derive(Debug, Clone)]
@@ -16,8 +16,8 @@ pub struct TextEncodeRequest {
     pub prompt: Prompt,
     pub task: PoolingTask,
     pub pooling_params: PoolingParams,
-    pub add_special_tokens: bool,
-    pub prompt_truncation: Option<PromptTruncation>,
+    /// Tokenization limits and options, like Python `TokenizeParams`.
+    pub tokenization: PoolingTokenization,
     pub arrival_time: Option<f64>,
     pub cache_salt: Option<String>,
     pub trace_headers: Option<BTreeMap<String, String>>,
@@ -30,11 +30,8 @@ pub struct TextEncodeRequest {
 impl TextRequestProcessor {
     /// Tokenize and validate a pooling input without generation defaults.
     pub fn prepare_encode(&self, request: TextEncodeRequest) -> Result<EncodeRequest> {
-        let prompt_token_ids = self.prepare_prompt_tokens(
-            request.prompt,
-            request.add_special_tokens,
-            request.prompt_truncation,
-        )?;
+        let prompt_token_ids =
+            self.tokenize_pooling_prompt(request.prompt, &request.tokenization)?;
         self.validate_prompt_tokens(&request.request_id, &prompt_token_ids)?;
         Ok(EncodeRequest {
             request_id: request.request_id,
@@ -54,6 +51,9 @@ impl TextRequestProcessor {
 
 impl TextLlm {
     /// Encode a batch in input order, validating all inputs before submission.
+    ///
+    /// Like Python's pooling serving, every input is submitted at once so the
+    /// engine can batch them; the first failure aborts the remaining inputs.
     pub async fn encode_batch(
         &self,
         requests: Vec<TextEncodeRequest>,
@@ -62,12 +62,16 @@ impl TextLlm {
             .into_iter()
             .map(|request| self.processor.prepare_encode(request))
             .collect::<Result<Vec<_>>>()?;
-        stream::iter(requests)
-            .map(|request| self.llm.encode(request))
-            .buffered(32)
-            .map_err(Into::into)
-            .try_collect()
-            .await
+        self.encode_prepared_batch(requests).await
+    }
+
+    /// Submit already-prepared token-level requests concurrently, returning
+    /// outputs in input order.
+    pub async fn encode_prepared_batch(
+        &self,
+        requests: Vec<EncodeRequest>,
+    ) -> Result<Vec<EncodeOutput>> {
+        Ok(try_join_all(requests.into_iter().map(|request| self.llm.encode(request))).await?)
     }
 
     /// Return engine-reported tasks, cached by the engine-core client.

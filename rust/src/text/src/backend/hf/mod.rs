@@ -48,6 +48,8 @@ pub struct HfTextBackend {
     model_vocab_size: usize,
     /// Model config (`config.json`).
     model_config: ModelConfig,
+    /// Token ID of the tokenizer's `pad_token`, used for prompt padding.
+    pad_token_id: Option<u32>,
 }
 
 impl HfTextBackend {
@@ -62,6 +64,8 @@ impl HfTextBackend {
         let model_config = load_model_config(files.config_path.as_deref())?;
         let model_vocab_size = model_config.vocab_size()? as usize;
         let generation_config = load_generation_config(files.generation_config_path.as_deref())?;
+        let pad_token_id = (tokenizer_config.special_tokens.pad_token.as_ref())
+            .and_then(|token| tokenizer.token_to_id(token.as_str()));
         let (primary_eos_token_id, extra_eos_token_ids) = resolve_eos_token_ids(
             &tokenizer_config,
             &model_config,
@@ -84,6 +88,7 @@ impl HfTextBackend {
             generation_config_mode,
             model_vocab_size,
             model_config,
+            pad_token_id,
         })
     }
 
@@ -137,6 +142,10 @@ impl TextBackend for HfTextBackend {
 
     fn tokenizer(&self) -> DynTokenizer {
         self.tokenizer.clone()
+    }
+
+    fn pad_token_id(&self) -> Option<u32> {
+        self.pad_token_id
     }
 
     fn is_moe(&self) -> bool {

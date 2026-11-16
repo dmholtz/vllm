@@ -1,28 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-//! Pooling HTTP protocols above the shared text encode facade.
+//! `/pooling` and `/classify`, mirroring Python's `ServingPooling` and
+//! `ServingClassification` (`vllm/entrypoints/pooling/`).
 
 mod types;
 
 use std::sync::Arc;
 
-use axum::{
-    Json,
-    extract::State,
-    http::HeaderMap,
-    response::{IntoResponse, Response},
-};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use axum::Json;
+use axum::extract::State;
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 use vllm_llm::{EncodeOutput, EngineTask, PoolingParams, PoolingTask};
-use vllm_text::{PromptTruncation, TextEncodeRequest, TruncationSide};
+use vllm_text::{PoolingTokenization, TextEncodeRequest};
 
-use self::types::{EncodingFormat, PoolingRequest};
+use self::types::{Padding, PoolingRequest};
 use crate::error::{
     ApiError, bail_invalid_request, invalid_request, server_error, text_submit_error,
 };
-use crate::routes::openai::utils::{types::Usage, validated_json::ValidatedJson};
+use crate::routes::openai::utils::validated_json::ValidatedJson;
+use crate::routes::pooling_chat::render_conversations;
+use crate::routes::pooling_encoding::{
+    BinaryItem, BinaryResponseInfo, EncodingFormat, PoolingUsage, binary_response, encode_base64,
+};
 use crate::state::AppState;
 use crate::utils::{resolve_request_context, unix_timestamp};
 
@@ -58,8 +60,8 @@ async fn handle_request(
         Ok(prepared) => prepared,
         Err(error) => return error.into_response(),
     };
-    match run_pooling(state.chat.text(), prepared).await {
-        Ok(response) => Json(response).into_response(),
+    match run_pooling(state, prepared).await {
+        Ok(response) => response,
         Err(error) => error.into_response(),
     }
 }
@@ -67,15 +69,108 @@ async fn handle_request(
 struct PreparedRequest {
     response_id: String,
     response_model: String,
-    encoding_format: EncodingFormat,
+    body: PoolingRequest,
     endpoint: Endpoint,
     requests: Vec<TextEncodeRequest>,
+}
+
+/// Wire literal of a task, as Python prints it in error messages.
+fn task_literal(task: impl serde::Serialize) -> String {
+    serde_json::to_value(task)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// Resolve the pooling task like Python `ServingPooling._verify_pooling_task`.
+async fn resolve_task(
+    state: &AppState,
+    body: &PoolingRequest,
+    endpoint: Endpoint,
+) -> Result<PoolingTask, ApiError> {
+    let requested = body.task()?;
+    let supported = state
+        .chat
+        .text()
+        .supported_tasks()
+        .await
+        .map_err(|error| text_submit_error("failed to discover pooling tasks", error))?;
+    let model_task = state.serving_tasks().and_then(|tasks| tasks.pooling_task()).or_else(|| {
+        // States built without an engine handshake: the priority order of
+        // Python `ModelConfig.get_pooling_task`.
+        [
+            PoolingTask::EmbedAndTokenClassify,
+            PoolingTask::Embed,
+            PoolingTask::Classify,
+            PoolingTask::TokenEmbed,
+            PoolingTask::TokenClassify,
+            PoolingTask::Plugin,
+        ]
+        .into_iter()
+        .find(|task| supported.contains(&EngineTask::Pooling(*task)))
+    });
+
+    let task = match endpoint {
+        // Python's `ClassificationRequest` has no `task` field; `/classify`
+        // always classifies.
+        Endpoint::Classify => PoolingTask::Classify,
+        Endpoint::Pooling => {
+            if body.dimensions.is_some() {
+                bail_invalid_request!(
+                    param = "dimensions",
+                    "dimensions is currently not supported"
+                );
+            }
+            let task = requested.or(model_task).ok_or_else(|| {
+                invalid_request!(param = "task", "The model does not support a pooling task.")
+            })?;
+            if Some(task) != model_task {
+                if supported.contains(&EngineTask::Pooling(task)) {
+                    bail_invalid_request!(
+                        param = "task",
+                        "Try switching the model's pooling_task via --pooler-config.task {}.",
+                        task_literal(task)
+                    );
+                }
+                // Python formats the supported tasks as a tuple repr.
+                let mut supported_repr = supported
+                    .iter()
+                    .map(|task| format!("'{}'", task_literal(task)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if supported.len() == 1 {
+                    supported_repr.push(',');
+                }
+                bail_invalid_request!(
+                    param = "task",
+                    "Unsupported task: '{}' Supported tasks: ({supported_repr})",
+                    task_literal(task),
+                );
+            }
+            task
+        }
+    };
+    if !supported.contains(&EngineTask::Pooling(task)) {
+        bail_invalid_request!(param = "task", "model does not support {task:?}");
+    }
+    match task {
+        // TODO: integrate IOProcessor plugins.
+        PoolingTask::Plugin => bail_invalid_request!(
+            param = "task",
+            "IOProcessor plugins are not supported by the Rust frontend yet."
+        ),
+        PoolingTask::EmbedAndTokenClassify => bail_invalid_request!(
+            param = "task",
+            "The `embed&token_classify` task is not supported by the online pooling API."
+        ),
+        task => Ok(task),
+    }
 }
 
 async fn prepare_request(
     state: &AppState,
     headers: &HeaderMap,
-    body: PoolingRequest,
+    mut body: PoolingRequest,
     endpoint: Endpoint,
 ) -> Result<PreparedRequest, ApiError> {
     body.validate_options()?;
@@ -86,94 +181,61 @@ async fn prepare_request(
     {
         return Err(ApiError::model_not_found(model.to_owned()));
     }
-    let fixed_task = match endpoint {
-        Endpoint::Classify => Some(PoolingTask::Classify),
-        Endpoint::Pooling => None,
-    };
-    if fixed_task.is_some() && body.task.is_some() && fixed_task != body.task {
-        bail_invalid_request!(param = "task", "task does not match this endpoint");
-    }
-    if matches!(endpoint, Endpoint::Classify)
-        && (body.dimensions.is_some() || body.encoding_format != EncodingFormat::Float)
-    {
-        bail_invalid_request!("classify does not accept dimensions or encoded outputs");
-    }
-    let add_special_tokens = body.add_special_tokens.unwrap_or(true);
-    let ctx = resolve_request_context(headers, body.request_id.as_deref());
-    let prompts = body.input.into_prompts();
-    if prompts.is_empty() {
-        bail_invalid_request!(param = "input", "input must contain at least one prompt");
-    }
-    let truncation = body
-        .truncate_prompt_tokens
-        .map(|limit| {
-            PromptTruncation::from_wire(
-                limit,
-                body.truncation_side.unwrap_or(TruncationSide::Right),
-            )
-        })
-        .transpose()
-        .map_err(|error| text_submit_error("invalid truncation", error))?;
-    let text = state.chat.text();
-    let tasks = text
-        .supported_tasks()
-        .await
-        .map_err(|error| text_submit_error("failed to discover pooling tasks", error))?;
-    let task = fixed_task
-        .or(body.task)
-        .or_else(|| {
-            [
-                PoolingTask::Embed,
-                PoolingTask::Classify,
-                PoolingTask::TokenEmbed,
-                PoolingTask::TokenClassify,
-            ]
-            .into_iter()
-            .find(|task| tasks.contains(&EngineTask::Pooling(*task)))
-        })
-        .ok_or_else(|| {
-            invalid_request!(
-                param = "task",
-                "model does not support a standard pooling task"
-            )
-        })?;
-    if !tasks.contains(&EngineTask::Pooling(task)) {
-        bail_invalid_request!(param = "task", "model does not support {task:?}");
-    }
-    // TODO: integrate IOProcessor plugins and composite pooling outputs.
-    if matches!(
-        task,
-        PoolingTask::Plugin | PoolingTask::EmbedAndTokenClassify
-    ) {
-        bail_invalid_request!(
-            param = "task",
-            "plugin and composite pooling outputs are not supported yet"
-        );
-    }
+    let task = resolve_task(state, &body, endpoint).await?;
+
     let prefix = match endpoint {
         Endpoint::Pooling => "pool",
         Endpoint::Classify => "classify",
     };
+    let ctx = resolve_request_context(headers, body.request_id.as_deref());
     let id = format!("{prefix}-{}", ctx.request_id);
-    let model = resolution
-        .lora_request
-        .as_ref()
+    let response_model = (resolution.lora_request.as_ref())
         .map(|lora| lora.lora_name.clone())
         .unwrap_or_else(|| resolution.model_names.first().cloned().unwrap_or_default());
+
+    let is_chat = body.messages.is_some();
+    let prompts = match (body.messages.take(), body.input.take()) {
+        (Some(messages), _) => {
+            render_conversations(state, &body.chat_render_options(), &id, vec![messages]).await?
+        }
+        (None, Some(input)) => input.into_prompts(),
+        (None, None) => unreachable!("validated by `validate_options`"),
+    };
+    if prompts.is_empty() {
+        bail_invalid_request!(param = "input", "input must contain at least one prompt");
+    }
+
+    // Python `FixedMaxLenTokenizeParamsMixin`: limited to `max_model_len`.
+    let max_model_len = state.chat.text().request_processor().max_model_len();
+    let tokenization = PoolingTokenization {
+        truncate_prompt_tokens: body.truncate_prompt_tokens,
+        truncation_side: body.truncation_side,
+        pad_prompt_tokens: (body.padding == Some(Padding::MaxLength)).then_some(max_model_len),
+        do_lower_case: state
+            .serving_tasks()
+            .and_then(|tasks| tasks.pooling.as_ref())
+            .is_some_and(|config| config.do_lower_case),
+        ..PoolingTokenization::new(
+            Some(max_model_len),
+            // Chat templates add their own special tokens.
+            body.add_special_tokens.unwrap_or(!is_chat),
+        )
+    };
+    let pooling_params = PoolingParams {
+        // Python's `ClassificationRequest` has no `dimensions`; it is ignored.
+        dimensions: body.dimensions.filter(|_| matches!(endpoint, Endpoint::Pooling)),
+        use_activation: body.use_activation,
+        ..Default::default()
+    };
     let requests = prompts
         .into_iter()
         .enumerate()
         .map(|(index, prompt)| TextEncodeRequest {
             prompt,
-            add_special_tokens,
-            prompt_truncation: truncation,
+            tokenization: tokenization.clone(),
             request_id: format!("{id}-{index}"),
             task,
-            pooling_params: PoolingParams {
-                dimensions: body.dimensions,
-                use_activation: body.use_activation,
-                ..Default::default()
-            },
+            pooling_params: pooling_params.clone(),
             arrival_time: Some(vllm_llm::current_unix_timestamp_secs()),
             cache_salt: body.cache_salt.clone(),
             trace_headers: None,
@@ -185,45 +247,100 @@ async fn prepare_request(
         .collect();
     Ok(PreparedRequest {
         response_id: id,
-        response_model: model,
-        encoding_format: body.encoding_format,
+        response_model,
+        body,
         endpoint,
         requests,
     })
 }
 
-async fn run_pooling(
-    text: &vllm_text::TextLlm,
-    prepared: PreparedRequest,
-) -> Result<Value, ApiError> {
-    let encoding = prepared.encoding_format;
+async fn run_pooling(state: &AppState, prepared: PreparedRequest) -> Result<Response, ApiError> {
+    let text = state.chat.text();
     let outputs = text
         .encode_batch(prepared.requests)
         .await
         .map_err(|error| text_submit_error("failed to encode pooling batch", error))?;
     let prompt_tokens = outputs.iter().map(|output| output.prompt_token_ids.len()).sum();
-    let data = outputs.iter().enumerate().map(|(index, output)| {
-        let values = &output.output.data;
-        if !values.iter().all(|value| value.is_finite()) {
-            return Err(server_error!("pooling output contains non-finite values"));
+    let created = unix_timestamp();
+    let body = &prepared.body;
+
+    let data = match prepared.endpoint {
+        Endpoint::Pooling if body.encoding_format.is_binary() => {
+            let items = outputs
+                .iter()
+                .map(|output| BinaryItem {
+                    values: &output.output.data,
+                    shape: &output.output.shape,
+                })
+                .collect::<Vec<_>>();
+            return binary_response(
+                &items,
+                BinaryResponseInfo {
+                    id: &prepared.response_id,
+                    created,
+                    model: &prepared.response_model,
+                    prompt_tokens,
+                },
+                body.encoding_format,
+                body.embed_dtype,
+                body.endianness,
+            );
         }
-        match prepared.endpoint {
-            Endpoint::Pooling => {
-                let data = tensor_json(output)?;
-                Ok(json!({"index": index, "object": "pooling", "data": if encoding == EncodingFormat::Base64 { encoded_values(values, encoding) } else { data }}))
-            }
-            Endpoint::Classify => {
-                vector(output)?;
-                let predicted = values.iter().enumerate().reduce(|best, item| if item.1 > best.1 { item } else { best })
-                    .ok_or_else(|| server_error!("classifier returned no classes"))?.0;
-                Ok(json!({"index": index, "label": text.classification_label(predicted), "probs": values, "num_classes": values.len()}))
-            }
+        Endpoint::Pooling => outputs
+            .iter()
+            .enumerate()
+            .map(|(index, output)| {
+                let data = match body.encoding_format {
+                    EncodingFormat::Base64 => {
+                        json!(encode_base64(
+                            &output.output.data,
+                            body.embed_dtype,
+                            body.endianness
+                        ))
+                    }
+                    _ => tensor_json(output)?,
+                };
+                Ok(json!({"index": index, "object": "pooling", "data": data}))
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?,
+        Endpoint::Classify => {
+            let pooling_config = state.serving_tasks().and_then(|tasks| tasks.pooling.as_ref());
+            outputs
+                .iter()
+                .enumerate()
+                .map(|(index, output)| {
+                    let probs = vector(output)?;
+                    // `np.argmax`: the first maximum wins.
+                    let predicted = probs
+                        .iter()
+                        .enumerate()
+                        .reduce(|best, item| if item.1 > best.1 { item } else { best })
+                        .ok_or_else(|| server_error!("classifier returned no classes"))?
+                        .0;
+                    // Labels resolved by engine-core honor `--hf-overrides`.
+                    let label = match pooling_config {
+                        Some(config) => config.label(predicted),
+                        None => text.classification_label(predicted),
+                    };
+                    Ok(json!({
+                        "index": index,
+                        "label": label,
+                        "probs": probs,
+                        "num_classes": probs.len(),
+                    }))
+                })
+                .collect::<Result<Vec<_>, ApiError>>()?
         }
-    }).collect::<Result<Vec<_>, ApiError>>()?;
-    Ok(
-        json!({"id": prepared.response_id, "object": "list", "created": unix_timestamp(), "model": prepared.response_model,
-        "data": data, "usage": Usage::from_counts(prompt_tokens, 0, None, 0)}),
-    )
+    };
+    Ok(Json(json!({
+        "id": prepared.response_id,
+        "object": "list",
+        "created": created,
+        "model": prepared.response_model,
+        "data": data,
+        "usage": PoolingUsage::new(prompt_tokens),
+    }))
+    .into_response())
 }
 
 fn vector(output: &EncodeOutput) -> Result<&[f32], ApiError> {
@@ -233,20 +350,7 @@ fn vector(output: &EncodeOutput) -> Result<&[f32], ApiError> {
             output.output.shape
         ));
     }
-    if !output.output.data.iter().all(|value| value.is_finite()) {
-        return Err(server_error!("pooling output contains non-finite values"));
-    }
     Ok(&output.output.data)
-}
-
-fn encoded_values(values: &[f32], encoding: EncodingFormat) -> Value {
-    match encoding {
-        EncodingFormat::Float => json!(values),
-        EncodingFormat::Base64 => json!(
-            STANDARD
-                .encode(values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>())
-        ),
-    }
 }
 
 fn tensor_json(output: &EncodeOutput) -> Result<Value, ApiError> {

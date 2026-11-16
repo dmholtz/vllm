@@ -22,7 +22,13 @@ pub enum Error {
         requested_task: EngineTask,
         supported_tasks: Vec<EngineTask>,
     },
-    #[error("request `{request_id}` was rejected by engine-core{}", error.as_ref().map(|e| format!(": {}", e.message)).unwrap_or_default())]
+    #[error(
+        "{}",
+        error.as_ref().map_or_else(
+            || format!("request `{request_id}` failed in engine-core"),
+            |error| error.message.clone(),
+        )
+    )]
     EngineRequest {
         request_id: String,
         error: Option<Box<RequestError>>,

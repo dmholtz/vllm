@@ -5858,6 +5858,7 @@ dependencies = [
  "educe",
  "expect-test",
  "futures",
+ "half",
  "http-body",
  "hyper",
  "hyper-util",

@@ -153,6 +153,9 @@ pub struct PoolingFrontendConfig {
     /// Maximum embedding input length; `None` falls back to `max_model_len`
     /// unless chunked processing is enabled.
     pub max_embed_len: Option<u32>,
+    /// Pooler-level default for `use_activation`; `None` means the task
+    /// default (`true` for embedding and classification).
+    pub use_activation: Option<bool>,
     /// Whether late-interaction scoring uses worker-side query caching.
     pub enable_flash_late_interaction: bool,
     /// Number of classifier labels, from the HF config.

@@ -13,6 +13,8 @@ mod metrics;
 pub(crate) mod openai;
 mod pause;
 mod pooling;
+pub(crate) mod pooling_chat;
+pub(crate) mod pooling_encoding;
 mod profile;
 pub(super) mod render;
 mod server_info;

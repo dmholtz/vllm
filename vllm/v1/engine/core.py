@@ -456,6 +456,7 @@ class EngineCore:
             "pooling_task": model_config.get_pooling_task(supported_tasks),
             "enable_chunked_processing": bool(pooler_config.enable_chunked_processing),
             "max_embed_len": pooler_config.max_embed_len,
+            "use_activation": pooler_config.use_activation,
             "enable_flash_late_interaction": bool(
                 pooler_config.enable_flash_late_interaction
             ),

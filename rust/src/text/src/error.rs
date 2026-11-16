@@ -30,6 +30,18 @@ pub enum Error {
     )]
     PromptTooLong { max_model_len: u32, prompt_len: u32 },
     #[error(
+        "This model's maximum context length is {max_total_tokens} tokens. However, your \
+         prompt contains {qualifier}{prompt_len} input tokens, which exceeds this limit even \
+         without any output tokens. Please reduce the length of the input prompt."
+    )]
+    PoolingPromptTooLong {
+        max_total_tokens: u32,
+        prompt_len: usize,
+        qualifier: &'static str,
+    },
+    #[error("Cannot pad prompt tokens: the tokenizer does not define a pad token.")]
+    MissingPadToken,
+    #[error(
         "This model's maximum context length is {max_model_len} tokens. However, your \
          prompt fills it with {max_model_len} input tokens, leaving no room for output \
          tokens. Please reduce the length of the input prompt."
@@ -77,6 +89,8 @@ impl Error {
         match self {
             Self::Embedding(error) => error.is_request_validation_error(),
             Self::PromptTooLong { .. }
+            | Self::PoolingPromptTooLong { .. }
+            | Self::MissingPadToken
             | Self::PromptFillsContext { .. }
             | Self::EmptyPromptTokenIds { .. }
             | Self::EmptyStopString { .. }
@@ -99,6 +113,9 @@ impl Error {
                 EngineCoreError::InvalidDataParallelRank { .. },
             ))
             | Self::EngineCore(EngineCoreError::InvalidStructuredOutputsParams { .. }) => true,
+            Self::Llm(LlmError::EngineRequest {
+                error: Some(error), ..
+            }) => error.is_validation_error(),
             _ => false,
         }
     }
@@ -107,7 +124,12 @@ impl Error {
     /// `param` of the OpenAI error object.
     pub fn param(&self) -> Option<&'static str> {
         match self {
-            Self::PromptTooLong { .. } | Self::PromptFillsContext { .. } => Some("input_tokens"),
+            Self::PromptTooLong { .. }
+            | Self::PoolingPromptTooLong { .. }
+            | Self::PromptFillsContext { .. } => Some("input_tokens"),
+            Self::TruncatePromptTokensExceedsMaxModelLen { .. }
+            | Self::InvalidTruncatePromptTokens { .. } => Some("truncate_prompt_tokens"),
+            Self::MissingPadToken => Some("pad_prompt_tokens"),
             _ => None,
         }
     }

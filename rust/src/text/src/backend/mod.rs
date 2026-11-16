@@ -108,6 +108,11 @@ pub trait TextBackend: Send + Sync {
         None
     }
 
+    /// Token ID used to pad prompts, from the tokenizer's `pad_token`.
+    fn pad_token_id(&self) -> Option<u32> {
+        None
+    }
+
     /// Return the tokenizer used by this backend.
     fn tokenizer(&self) -> DynTokenizer;
 

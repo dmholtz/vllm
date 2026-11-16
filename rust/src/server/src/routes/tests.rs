@@ -885,6 +885,198 @@ async fn test_pooling_app_with_outputs(
     )
 }
 
+/// Python `EmbedIOProcessor` chunked processing: an input longer than
+/// `max_model_len` is split into chunks whose embeddings are averaged by
+/// token count and renormalized.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn embeddings_chunk_long_inputs_and_average_chunk_embeddings() {
+    use vllm_engine_core_client::protocol::pooling::PoolingFrontendConfig;
+
+    use crate::serving_tasks::ServingTasks;
+
+    let ipc = IpcNamespace::new().expect("create ipc namespace");
+    let handshake_address = ipc.handshake_endpoint();
+    let mut ready = default_ready_response();
+    ready.max_model_len = 4;
+    let engine_task = MockEngineTask::new(spawn_mock_engine_task_with_ready(
+        handshake_address.clone(),
+        b"engine-embeddings-chunked".to_vec(),
+        ready,
+        move |dealer, push| {
+            boxed_test_future(async move {
+                tokio::time::timeout(Duration::from_secs(10), async move {
+                    let utility = recv_engine_message(dealer).await;
+                    let utility: EngineCoreUtilityRequest =
+                        rmp_serde::from_slice(&utility[1]).expect("decode utility request");
+                    assert_eq!(utility.method_name, "get_supported_tasks");
+                    send_outputs(
+                        push,
+                        utility_outputs(
+                            utility.call_id.as_u64().expect("numeric call id"),
+                            utility_result_value(vec!["embed"]),
+                        ),
+                    )
+                    .await;
+
+                    // Chunks of 4, 4 and 2 tokens; the middle one points elsewhere.
+                    let chunk_outputs = [[1.0_f32, 0.0], [0.0, 1.0], [1.0, 0.0]];
+                    for (index, values) in chunk_outputs.into_iter().enumerate() {
+                        let add = recv_engine_message(dealer).await;
+                        assert_eq!(add[0].as_ref(), &[0x00]);
+                        let request: EngineCoreRequest =
+                            rmp_serde::from_slice(&add[1]).expect("decode request");
+                        assert_eq!(
+                            request.external_req_id.as_deref(),
+                            Some(format!("embd-chunked-prompt-0-chunk-{index}").as_str())
+                        );
+                        let expected = (1..=10).collect::<Vec<u32>>();
+                        let expected = expected.chunks(4).nth(index).unwrap();
+                        assert_eq!(request.prompt_token_ids.as_deref(), Some(expected));
+                        send_outputs(
+                            push,
+                            RequestBatchOutputs {
+                                outputs: vec![EngineCoreOutput {
+                                    request_id: request.request_id.clone(),
+                                    pooling_output: Some(Box::new(
+                                        WireTensor::from_f32(vec![2], values.to_vec()).unwrap(),
+                                    )),
+                                    finish_reason: Some(EngineCoreFinishReason::Stop),
+                                    ..Default::default()
+                                }],
+                                finished_requests: Some([request.request_id].into_iter().collect()),
+                                ..Default::default()
+                            }
+                            .into(),
+                        )
+                        .await;
+                    }
+                })
+                .await
+                .expect("chunked embedding mock engine timed out");
+            })
+        },
+    ));
+    let client = EngineCoreClient::connect(
+        EngineCoreClientConfig::new_single(handshake_address)
+            .with_model_name("test-model")
+            .with_local_input_output_addresses(
+                Some(ipc.input_endpoint()),
+                Some(ipc.output_endpoint()),
+            ),
+    )
+    .await
+    .expect("connect client");
+    let chat = ChatLlm::from_shared_backend(test_llm(client), Arc::new(FakeChatBackend::new()));
+    let state = AppState::new(vec!["model".to_string()], chat).with_serving_tasks(ServingTasks {
+        supported: vec![EngineTask::Pooling(PoolingTask::Embed)],
+        pooling: Some(PoolingFrontendConfig {
+            pooling_task: Some(PoolingTask::Embed),
+            enable_chunked_processing: true,
+            max_embed_len: Some(16),
+            ..Default::default()
+        }),
+    });
+    let mut app = build_router(Arc::new(state));
+
+    // Inputs above `max_embed_len` are rejected before any submission.
+    let (status, response) = post_pooling_json(
+        &mut app,
+        "/v1/embeddings",
+        json!({"input": (0..17).collect::<Vec<u32>>()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("This model's maximum context length is 16 tokens."),
+        "{response}"
+    );
+
+    let (status, response) = post_pooling_json(
+        &mut app,
+        "/v1/embeddings",
+        json!({"input": (1..=10).collect::<Vec<u32>>(), "request_id": "chunked"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    // Token-weighted mean (6, 4) / 10, renormalized to unit length.
+    let embedding = response["data"][0]["embedding"].as_array().unwrap();
+    let embedding = embedding.iter().map(|value| value.as_f64().unwrap()).collect::<Vec<_>>();
+    let norm = (0.6f64 * 0.6 + 0.4 * 0.4).sqrt();
+    assert!((embedding[0] - 0.6 / norm).abs() < 1e-6, "{response}");
+    assert!((embedding[1] - 0.4 / norm).abs() < 1e-6, "{response}");
+    assert_eq!(response["usage"]["prompt_tokens"], 10);
+    engine_task.finish().await;
+}
+
+/// Chat inputs are rendered with the chat template, and `bytes` responses
+/// carry raw `embed_dtype` values plus a JSON `metadata` header.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn embeddings_render_chat_inputs_and_encode_bytes() {
+    let (app, engine) = test_pooling_app_with_outputs(
+        "engine-embeddings-chat-bytes",
+        vec![PoolingTask::Embed],
+        vec![WireTensor::from_f32(vec![2], vec![1.0, -2.5]).unwrap()],
+        PoolingOutputOrder::Immediate,
+        |request| {
+            assert_eq!(
+                request.pooling_params.as_ref().unwrap().task,
+                PoolingTask::Embed
+            );
+            assert!(!request.prompt_token_ids.as_deref().unwrap().is_empty());
+        },
+    )
+    .await;
+    let response = app
+        .clone()
+        .call(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "request_id": "chat",
+                        "encoding_format": "bytes",
+                        "embed_dtype": "float16",
+                        "endianness": "big",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/octet-stream"
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_str(response.headers()["metadata"].to_str().unwrap()).unwrap();
+    assert_eq!(metadata["id"], "embd-chat");
+    assert_eq!(
+        metadata["data"],
+        json!([{
+            "index": 0,
+            "embed_dtype": "float16",
+            "endianness": "big",
+            "start": 0,
+            "end": 4,
+            "shape": [2],
+        }])
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    // float16 1.0 = 0x3c00, -2.5 = 0xc100, big-endian.
+    assert_eq!(body.as_ref(), &[0x3c, 0x00, 0xc1, 0x00]);
+    engine.finish().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn pooling_preserves_batch_order_shape_and_usage() {
@@ -998,9 +1190,21 @@ async fn pooling_rejects_invalid_inputs_before_submitting_any_batch_member() {
         ),
         (
             "/pooling",
-            json!({"input": "x", "dimensions": 0}),
+            json!({"input": "x", "dimensions": 2}),
             vec!["embed"],
-            "dimensions must be positive",
+            "dimensions is currently not supported",
+        ),
+        (
+            "/pooling",
+            json!({"input": "x", "task": "classify"}),
+            vec!["embed", "classify"],
+            "Try switching the model's pooling_task via --pooler-config.task classify.",
+        ),
+        (
+            "/pooling",
+            json!({"input": "x", "task": "score"}),
+            vec!["embed"],
+            "`score` task was removed; use `classify` instead.",
         ),
         (
             "/pooling",
@@ -1012,7 +1216,7 @@ async fn pooling_rejects_invalid_inputs_before_submitting_any_batch_member() {
             "/pooling",
             json!({"input": "x", "normalize": true}),
             vec!["embed"],
-            "parameter `normalize` is not supported",
+            "Parameter `normalize` was removed; use `use_activation` instead.",
         ),
         (
             "/pooling",
@@ -1024,31 +1228,13 @@ async fn pooling_rejects_invalid_inputs_before_submitting_any_batch_member() {
             "/pooling",
             json!({"input": "x", "task": "classify"}),
             vec!["embed"],
-            "model does not support Classify",
+            "Unsupported task: 'classify' Supported tasks: ('embed',)",
         ),
         (
             "/pooling",
             json!({"input": "x", "truncate_prompt_tokens": -2}),
             vec!["embed"],
-            "invalid truncate_prompt_tokens=-2",
-        ),
-        (
-            "/classify",
-            json!({"input": "x", "task": "embed"}),
-            vec!["embed", "classify"],
-            "task does not match this endpoint",
-        ),
-        (
-            "/classify",
-            json!({"input": "x", "dimensions": 2}),
-            vec!["classify"],
-            "classify does not accept dimensions or encoded outputs",
-        ),
-        (
-            "/classify",
-            json!({"input": "x", "encoding_format": "base64"}),
-            vec!["classify"],
-            "classify does not accept dimensions or encoded outputs",
+            "truncate_prompt_tokens must be greater than or equal to -1",
         ),
         (
             "/classify",
@@ -1210,8 +1396,8 @@ async fn pooling_selects_default_task_independently_of_engine_task_order() {
         ),
         (
             vec![PoolingTask::Embed, PoolingTask::Classify],
-            Some("classify"),
-            PoolingTask::Classify,
+            Some("embed"),
+            PoolingTask::Embed,
         ),
     ] {
         let (mut app, engine) = test_pooling_app_with_outputs(
@@ -1254,7 +1440,6 @@ async fn pooling_forwards_options_and_truncates_each_text_prompt() {
                     request.prompt_token_ids.as_deref(),
                     Some(expected.as_slice())
                 );
-                assert_eq!(request.pooling_params.as_ref().unwrap().dimensions, Some(2));
                 assert_eq!(
                     request.pooling_params.as_ref().unwrap().use_activation,
                     Some(false)
@@ -1275,7 +1460,6 @@ async fn pooling_forwards_options_and_truncates_each_text_prompt() {
                         json!({
                             "input": ["abc", "xyz"],
                             "request_id": "body-id",
-                            "dimensions": 2,
                             "use_activation": false,
                             "priority": 7,
                             "cache_salt": "tenant",
@@ -1334,21 +1518,9 @@ async fn pooling_respects_add_special_tokens_without_truncation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
 async fn pooling_rejects_invalid_engine_outputs() {
+    // Non-finite values serialize as `null` like Python's orjson, so only
+    // malformed shapes are rejected.
     for (uri, task, shape, values, message) in [
-        (
-            "/pooling",
-            PoolingTask::Embed,
-            vec![1],
-            vec![f32::NAN],
-            "non-finite",
-        ),
-        (
-            "/classify",
-            PoolingTask::Classify,
-            vec![1],
-            vec![f32::INFINITY],
-            "non-finite",
-        ),
         (
             "/classify",
             PoolingTask::Classify,
@@ -2193,8 +2365,8 @@ async fn embeddings_returns_openai_response_and_pooling_usage() {
             "model": String("Qwen/Qwen1.5-0.5B-Chat"),
             "data": Array [
                 Object {
-                    "object": String("embedding"),
                     "index": Number(0),
+                    "object": String("embedding"),
                     "embedding": Array [
                         Number(0.25),
                         Number(-0.5),
@@ -2206,9 +2378,7 @@ async fn embeddings_returns_openai_response_and_pooling_usage() {
                 "total_tokens": Number(3),
                 "completion_tokens": Number(0),
                 "prompt_tokens_details": Null,
-                "completion_tokens_details": Object {
-                    "reasoning_tokens": Number(0),
-                },
+                "completion_tokens_details": Null,
             },
         }
     "#]]
