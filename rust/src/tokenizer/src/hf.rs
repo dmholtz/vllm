@@ -541,16 +541,10 @@ mod tests {
                 "fused={fused}, text={text:?}",
             );
         }
-        if matches!(&tokenizer.backend, super::Backend::Hf(_)) {
-            assert_eq!(
-                tokenizer
-                    .encode_ordinary("hello <|regular|> Cafe\u{301} <|special|> tail")
-                    .unwrap()
-                    .len(),
-                24,
-                "HF post-processing must retain configured truncation",
-            );
-        }
+        // The fixture configures truncation to 24 tokens; like transformers and
+        // fastokens, every backend ignores it (prompt limits use `max_model_len`).
+        let text = "hello <|regular|> Cafe\u{301} <|special|> tail";
+        assert_eq!(tokenizer.encode_ordinary(text).unwrap().len(), 40);
     }
 
     #[test]
