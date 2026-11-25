@@ -241,8 +241,15 @@ impl HuggingFaceTokenizer {
     pub fn new_hf(path: &Path) -> Result<Self> {
         info!(path = %path.display(), "loading tokenizer with huggingface tokenizers");
         let tokenizer_json = load_tokenizer_json_with_extra_tokens(path)?;
-        let t = serde_json::from_value::<HfTokenizer>(tokenizer_json)
+        let mut t = serde_json::from_value::<HfTokenizer>(tokenizer_json)
             .map_err(|error| tokenizer_error!("failed to load tokenizer: {}", error.as_report()))?;
+        // `tokenizer.json` may carry fixed padding/truncation (e.g. all-MiniLM-L6-v2 pads and
+        // truncates to 128). transformers' fast tokenizers disable both unless the caller asks
+        // for them, and prompt length limits are enforced against `max_model_len` instead.
+        t.with_padding(None);
+        t.with_truncation(None).map_err(|error| {
+            tokenizer_error!("failed to disable truncation: {}", error.as_report())
+        })?;
         Ok(Self::from_hf_backend(t))
     }
 
