@@ -19,9 +19,11 @@ use tracing::{info, warn};
 
 use crate::byte_level_decode::decode_byte_level;
 use crate::hf::added_tokens::load_tokenizer_json_with_extra_tokens;
+pub use crate::hf::wordpiece::BertWordPieceOptions;
 use crate::{Result, Tokenizer};
 
 mod added_tokens;
+mod wordpiece;
 
 static EMPTY_HF_ADDED_VOCABULARY: LazyLock<AddedVocabulary> = LazyLock::new(AddedVocabulary::new);
 
@@ -251,6 +253,15 @@ impl HuggingFaceTokenizer {
             tokenizer_error!("failed to disable truncation: {}", error.as_report())
         })?;
         Ok(Self::from_hf_backend(t))
+    }
+
+    /// Build a BERT WordPiece tokenizer from `vocab.txt`, as transformers does
+    /// for checkpoints without `tokenizer.json`.
+    pub fn from_bert_vocab(vocab: &Path, options: &BertWordPieceOptions) -> Result<Self> {
+        info!(path = %vocab.display(), "building BERT WordPiece tokenizer from vocab");
+        Ok(Self::from_hf_backend(wordpiece::bert_wordpiece_tokenizer(
+            vocab, options,
+        )?))
     }
 
     /// Load from `tokenizer.json` via fastokens or HuggingFace tokenizers.

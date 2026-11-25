@@ -4,6 +4,7 @@
 mod config;
 mod model_files;
 mod overrides;
+mod wordpiece;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -28,6 +29,9 @@ fn load_tokenizer(tokenizer: &TokenizerSource) -> Result<DynTokenizer> {
         TokenizerSource::HuggingFace(path) => Ok(Arc::new(HuggingFaceTokenizer::new(path)?)),
         TokenizerSource::Tiktoken(path) => Ok(Arc::new(TiktokenTokenizer::new(path)?)),
         TokenizerSource::Tekken(path) => Ok(Arc::new(TekkenTokenizer::new(path)?)),
+        TokenizerSource::BertWordPiece { vocab, options } => Ok(Arc::new(
+            HuggingFaceTokenizer::from_bert_vocab(vocab, options)?,
+        )),
     }
 }
 

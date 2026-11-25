@@ -10,8 +10,11 @@ use hf_hub::{Cache, Repo, RepoType};
 use serde::Serialize;
 use thiserror_ext::AsReport as _;
 
+use vllm_tokenizer::BertWordPieceOptions;
+
 use super::HfOverrides;
-use super::config::{HfTokenizerConfig, load_tokenizer_config};
+use super::config::{HfTokenizerConfig, load_model_config, load_tokenizer_config};
+use super::wordpiece::{bert_wordpiece_options, uses_bert_wordpiece};
 use crate::error::{Error, Result};
 
 const HF_TOKEN_ENV: &str = "HF_TOKEN";
@@ -30,12 +33,21 @@ pub enum TokenizerSource {
     /// models has a known regex bug that produces incorrect token IDs for
     /// some inputs.
     Tekken(PathBuf),
+    /// Path to `vocab.txt` of a BERT-family checkpoint without `tokenizer.json`.
+    ///
+    /// The tokenizer is built from the vocab like transformers' slow-to-fast
+    /// `BertConverter`, which the Python frontend uses for these checkpoints.
+    BertWordPiece {
+        vocab: PathBuf,
+        options: BertWordPieceOptions,
+    },
 }
 
 impl TokenizerSource {
     pub fn path(&self) -> &Path {
         match self {
             Self::HuggingFace(path) | Self::Tiktoken(path) | Self::Tekken(path) => path,
+            Self::BertWordPiece { vocab, .. } => vocab,
         }
     }
 }
@@ -152,7 +164,9 @@ impl ResolvedModelFiles {
         }
 
         Ok(Self {
-            tokenizer: tokenizer_files.tokenizer(&tokenizer_config).await?,
+            tokenizer: tokenizer_files
+                .tokenizer(&tokenizer_config, tokenizer_config_path.as_deref())
+                .await?,
             tokenizer_config_path,
             generation_config_path: config_files.get("generation_config.json").await?,
             preprocessor_config_path: model_files.get("preprocessor_config.json").await?,
@@ -280,7 +294,9 @@ impl SourceFiles {
     /// Return whether this source provides `required`.
     async fn contains(&self, required: RequiredFile) -> Result<bool> {
         Ok(match required {
-            RequiredFile::Tokenizer => self.tokenizer_file().await?.is_some(),
+            RequiredFile::Tokenizer => {
+                self.tokenizer_file().await?.is_some() || self.get(BERT_VOCAB).await?.is_some()
+            }
             RequiredFile::Config => self.get("config.json").await?.is_some(),
             RequiredFile::Nothing => true,
         })
@@ -306,18 +322,30 @@ impl SourceFiles {
         }
     }
 
-    /// Select the tokenizer source from the files found by [`Self::tokenizer_file`].
-    async fn tokenizer(&self, tokenizer_config: &HfTokenizerConfig) -> Result<TokenizerSource> {
+    /// Select the tokenizer source from the files found by [`Self::tokenizer_file`],
+    /// falling back to the `vocab.txt` of a BERT-family checkpoint.
+    async fn tokenizer(
+        &self,
+        tokenizer_config: &HfTokenizerConfig,
+        tokenizer_config_path: Option<&Path>,
+    ) -> Result<TokenizerSource> {
         let Some(tokenizer_path) = self.tokenizer_file().await? else {
+            if let Some(source) =
+                self.bert_wordpiece(tokenizer_config, tokenizer_config_path).await?
+            {
+                return Ok(source);
+            }
             return Err(Error::Tokenizer(match self {
                 Self::Dir(dir) => format!(
                     "local model directory '{}' does not contain a supported tokenizer file \
-                     (tokenizer.json, tiktoken.model, or *.tiktoken)",
+                     (tokenizer.json, tiktoken.model, *.tiktoken, or vocab.txt of a BERT \
+                     tokenizer)",
                     dir.display()
                 ),
                 Self::Remote { model_id, .. } => format!(
                     "model '{model_id}' does not expose a supported tokenizer file \
-                     (tokenizer.json, tiktoken.model, or *.tiktoken) on Hugging Face"
+                     (tokenizer.json, tiktoken.model, *.tiktoken, or vocab.txt of a BERT \
+                     tokenizer) on Hugging Face"
                 ),
             }));
         };
@@ -330,6 +358,36 @@ impl SourceFiles {
             tokenizer_config.tokenizer_class.as_deref(),
             None,
         ))
+    }
+
+    /// The BERT WordPiece tokenizer source, when this source has `vocab.txt` and
+    /// transformers would build a BERT tokenizer for it: by `tokenizer_class`,
+    /// or else by the `model_type` of the tokenizer source's own `config.json`
+    /// (`AutoTokenizer` reads the config of the path it loads from).
+    async fn bert_wordpiece(
+        &self,
+        tokenizer_config: &HfTokenizerConfig,
+        tokenizer_config_path: Option<&Path>,
+    ) -> Result<Option<TokenizerSource>> {
+        let Some(vocab) = self.get(BERT_VOCAB).await? else {
+            return Ok(None);
+        };
+        let model_config = match tokenizer_config.tokenizer_class {
+            Some(_) => None,
+            None => Some(load_model_config(
+                self.get("config.json").await?.as_deref(),
+            )?),
+        };
+        let model_type = model_config.as_ref().and_then(|config| config.model_type());
+        if !uses_bert_wordpiece(tokenizer_config.tokenizer_class.as_deref(), model_type) {
+            return Ok(None);
+        }
+        let options = bert_wordpiece_options(
+            tokenizer_config_path,
+            self.get("special_tokens_map.json").await?.as_deref(),
+            self.get("added_tokens.json").await?.as_deref(),
+        )?;
+        Ok(Some(TokenizerSource::BertWordPiece { vocab, options }))
     }
 
     /// Find the dedicated chat template file, if any.
@@ -347,6 +405,9 @@ impl SourceFiles {
         }
     }
 }
+
+/// Vocabulary of a BERT WordPiece tokenizer (see [`TokenizerSource::BertWordPiece`]).
+const BERT_VOCAB: &str = "vocab.txt";
 
 /// Locate the cached snapshot directory of `repo` at its revision.
 fn cached_snapshot_dir(cache: &Cache, repo: &Repo) -> Option<PathBuf> {
@@ -533,6 +594,44 @@ mod tests {
             siblings.insert(name.to_string());
             assert_eq!(super::remote_chat_template_name(&siblings), Some(name));
         }
+    }
+
+    #[tokio::test]
+    async fn bert_checkpoint_without_tokenizer_json_uses_its_vocab() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("vocab.txt"),
+            "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("config.json"), r#"{"model_type":"bert"}"#).unwrap();
+        fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"do_lower_case":false}"#,
+        )
+        .unwrap();
+
+        let files = ResolvedModelFiles::new(dir.path().to_str().unwrap(), None).await.unwrap();
+        let TokenizerSource::BertWordPiece { vocab, options } = &files.tokenizer else {
+            panic!(
+                "expected a BERT WordPiece tokenizer, got {:?}",
+                files.tokenizer
+            );
+        };
+        assert_eq!(vocab, &dir.path().join("vocab.txt"));
+        assert!(!options.do_lower_case);
+
+        // Without a BERT class or model type the vocab is not a tokenizer.
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type":"roberta"}"#,
+        )
+        .unwrap();
+        let error = ResolvedModelFiles::new(dir.path().to_str().unwrap(), None).await.unwrap_err();
+        assert!(
+            format!("{error:?}").contains("vocab.txt of a BERT tokenizer"),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]
