@@ -382,7 +382,9 @@ impl MultimodalModelInfo {
     ///
     /// Returns `Ok(Some(_))` only when the model spec is registered and at
     /// least one modality resolves. File read/parse failures are real errors;
-    /// unsupported model families are logged and returned as `Ok(None)`.
+    /// unsupported model families are logged and returned as `Ok(None)`
+    /// before their preprocessor configs are parsed, since no processor of
+    /// this frontend would read them (e.g. CLIP's legacy integer `crop_size`).
     pub fn from_paths(
         model_id: String,
         model_type: Option<String>,
@@ -399,6 +401,21 @@ impl MultimodalModelInfo {
             }
             None => serde_json::Value::Object(Default::default()),
         };
+        let context = MultimodalModelContext {
+            model_id,
+            model_type,
+            config,
+            tokenizer: TokenizerResolver(tokenizer),
+        };
+        if context.resolve_model_spec().is_none() {
+            warn!(
+                model_id = context.model_id,
+                model_type = context.model_type,
+                "multimodal model spec is not registered; disabling multimodal support for this model"
+            );
+            return Ok(None);
+        }
+
         let preprocessor_config = load_preprocessor_config(
             files.preprocessor_config,
             "preprocessor_config.json",
@@ -421,13 +438,6 @@ impl MultimodalModelInfo {
             "feature_extractor",
         )?
         .unwrap_or_else(|| preprocessor_config.clone());
-
-        let context = MultimodalModelContext {
-            model_id,
-            model_type,
-            config,
-            tokenizer: TokenizerResolver(tokenizer),
-        };
 
         Self::from_loaded(
             context,

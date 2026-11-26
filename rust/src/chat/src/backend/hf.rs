@@ -437,23 +437,50 @@ mod tests {
         .unwrap();
 
         assert!(backend.multimodal_model_info().is_none());
+    }
 
-        let invalid_preprocessor_config = r#"{"size":[672,672]"#;
-        write_json(&preprocessor_config_path, invalid_preprocessor_config);
+    /// Preprocessor configs are parsed only for registered multimodal model
+    /// families: a broken one fails startup, while an unsupported family (CLIP
+    /// with its legacy integer `crop_size`) starts with multimodal disabled.
+    #[test]
+    fn preprocessor_config_is_parsed_only_for_registered_multimodal_models() {
+        let load = |config_json: &str, preprocessor_config: &str| {
+            let mut files = resolved_files(
+                config_json,
+                r#"{"chat_template":"{{ messages[0].content }}"}"#,
+            );
+            let path = files
+                .config_path
+                .as_ref()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("preprocessor_config.json");
+            write_json(&path, preprocessor_config);
+            files.preprocessor_config_path = Some(path);
+            HfChatBackend::from_resolved_model_files(
+                files,
+                "test-model".to_string(),
+                LoadModelBackendsOptions {
+                    chat_template_content_format: Default::default(),
+                    chat_template: None,
+                    default_chat_template_kwargs: HashMap::new(),
+                    ..Default::default()
+                },
+                test_tokenizer(),
+            )
+        };
 
-        let error = HfChatBackend::from_resolved_model_files(
-            files,
-            "test-model".to_string(),
-            LoadModelBackendsOptions {
-                chat_template_content_format: Default::default(),
-                chat_template: None,
-                default_chat_template_kwargs: HashMap::new(),
-                ..Default::default()
-            },
-            test_tokenizer(),
+        let clip = load(
+            r#"{"model_type":"clip"}"#,
+            r#"{"crop_size":224,"size":224}"#,
         )
-        .err()
-        .expect("invalid preprocessor config should fail without language_model_only");
+        .expect("an unsupported multimodal family should not parse its preprocessor config");
+        assert!(clip.multimodal_model_info().is_none());
+
+        let error = load(r#"{"model_type":"qwen3_vl"}"#, r#"{"size":[672,672]"#)
+            .err()
+            .expect("invalid preprocessor config of a registered model should fail");
         assert!(error.to_string().contains("failed to parse preprocessor_config.json"));
     }
 
