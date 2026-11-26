@@ -2020,6 +2020,68 @@ fn custom_histogram_buckets_reach_frontend_config() {
     assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
 }
 
+fn frontend_args_json(args_json: &str) -> Result<Cli, clap::Error> {
+    Cli::try_parse_from([
+        "vllm-rs",
+        "frontend",
+        "--listen-fd",
+        "3",
+        "--input-listener-fd",
+        "999999",
+        "--output-listener-fd",
+        "999998",
+        "--args-json",
+        args_json,
+    ])
+}
+
+/// The Rust frontend has no multimodal processor cache, which is what
+/// `mm_processor_cache_gb=0` asks for (e.g. CLIP benchmarks); other sizes
+/// stay rejected on both the `vllm-rs serve` and the `--args-json` paths.
+#[test]
+fn mm_processor_cache_gb_accepts_only_zero() {
+    for value in ["0", "0.0"] {
+        Cli::try_parse_from([
+            "vllm-rs",
+            "serve",
+            "openai/clip-vit-base-patch32",
+            "--mm-processor-cache-gb",
+            value,
+        ])
+        .unwrap_or_else(|error| panic!("{value}: {error}"));
+    }
+    // Python serializes the float field as `0.0`.
+    for value in [serde_json::json!(0), serde_json::json!(0.0)] {
+        let args_json = serde_json::json!({
+            "model_tag": "openai/clip-vit-base-patch32",
+            "mm_processor_cache_gb": value,
+        });
+        frontend_args_json(&args_json.to_string())
+            .unwrap_or_else(|error| panic!("{value}: {error}"));
+    }
+
+    let error = Cli::try_parse_from([
+        "vllm-rs",
+        "serve",
+        "openai/clip-vit-base-patch32",
+        "--mm-processor-cache-gb",
+        "4",
+    ])
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("only 0 is supported; argument is not implemented"),
+        "{error}"
+    );
+
+    let error = frontend_args_json(
+        r#"{"model_tag":"openai/clip-vit-base-patch32","mm_processor_cache_gb":4.0}"#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("- mm_processor_cache_gb\n"), "{error}");
+}
+
 /// Frontend-read Python args that Rust recognizes but does not support yet must
 /// fail startup on both the `vllm-rs serve` and the `--args-json` paths.
 #[test]

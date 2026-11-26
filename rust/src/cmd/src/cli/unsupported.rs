@@ -20,17 +20,50 @@ use serde::{Deserialize, Deserializer, Serialize};
 #[serde(transparent)]
 pub struct Unsupported(pub serde_json::Value);
 
-impl FromStr for Unsupported {
-    type Err = String;
-
-    fn from_str(_s: &str) -> Result<Self, Self::Err> {
-        Err("argument is not implemented in Rust frontend yet
+const UNSUPPORTED_MESSAGE: &str = "argument is not implemented in Rust frontend yet
 
 Remove this unsupported argument to continue.
 
 Alternatively, if you intend to pass it only to the Python engine, put it after `--` (e.g., `-- <arg>`).
-This may lead to unexpected behavior as the Rust frontend will completely ignore that argument."
-            .to_string())
+This may lead to unexpected behavior as the Rust frontend will completely ignore that argument.";
+
+impl FromStr for Unsupported {
+    type Err = String;
+
+    fn from_str(_s: &str) -> Result<Self, Self::Err> {
+        Err(UNSUPPORTED_MESSAGE.to_string())
+    }
+}
+
+/// Marker type for a numeric `serve` argument whose only value the Rust
+/// frontend implements is `0`, because `0` disables a feature that the Rust
+/// frontend does not have (e.g. a size-0 cache).
+///
+/// `0` is accepted and left out when serializing, so [`UnsupportedArgs::check`]
+/// ignores it; any other value is kept and rejected like [`Unsupported`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ZeroOnly(pub serde_json::Value);
+
+impl ZeroOnly {
+    fn is_zero(&self) -> bool {
+        self.0.as_f64() == Some(0.0)
+    }
+
+    /// Serde `skip_serializing_if` predicate: unset or `0`.
+    fn is_unset_or_zero(value: &Option<Self>) -> bool {
+        value.as_ref().is_none_or(Self::is_zero)
+    }
+}
+
+impl FromStr for ZeroOnly {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.parse::<f64>() {
+            Ok(0.0) => Ok(Self(serde_json::json!(0))),
+            _ => Err(format!("only 0 is supported; {UNSUPPORTED_MESSAGE}")),
+        }
     }
 }
 
@@ -322,8 +355,14 @@ pub struct EngineUnsupportedArgs {
     pub mm_processor_kwargs: Option<Unsupported>,
 
     /// The size (in GiB) of the multi-modal processor cache.
+    ///
+    /// The Rust frontend has no processor cache and always sends processed
+    /// multimodal data to the engine, which is what `0` (cache disabled)
+    /// requests, so only `0` is accepted.
+    // TODO: implement the frontend (P0) processor cache.
     #[arg(long)]
-    pub mm_processor_cache_gb: Option<Unsupported>,
+    #[serde(default, skip_serializing_if = "ZeroOnly::is_unset_or_zero")]
+    pub mm_processor_cache_gb: Option<ZeroOnly>,
 
     /// Type of cache to use for the multi-modal preprocessor/mapper.
     #[arg(long)]
