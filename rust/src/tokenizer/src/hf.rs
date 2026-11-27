@@ -19,10 +19,12 @@ use tracing::{info, warn};
 
 use crate::byte_level_decode::decode_byte_level;
 use crate::hf::added_tokens::load_tokenizer_json_with_extra_tokens;
+pub use crate::hf::roberta::{RobertaBpeOptions, RobertaSpecialToken};
 pub use crate::hf::wordpiece::BertWordPieceOptions;
 use crate::{Result, Tokenizer};
 
 mod added_tokens;
+mod roberta;
 mod wordpiece;
 
 static EMPTY_HF_ADDED_VOCABULARY: LazyLock<AddedVocabulary> = LazyLock::new(AddedVocabulary::new);
@@ -261,6 +263,24 @@ impl HuggingFaceTokenizer {
         info!(path = %vocab.display(), "building BERT WordPiece tokenizer from vocab");
         Ok(Self::from_hf_backend(wordpiece::bert_wordpiece_tokenizer(
             vocab, options,
+        )?))
+    }
+
+    /// Build a RoBERTa byte-level BPE tokenizer from `vocab.json` and
+    /// `merges.txt`, as transformers does for checkpoints without
+    /// `tokenizer.json`.
+    pub fn from_roberta_vocab(
+        vocab: &Path,
+        merges: &Path,
+        options: &RobertaBpeOptions,
+    ) -> Result<Self> {
+        info!(
+            vocab = %vocab.display(),
+            merges = %merges.display(),
+            "building RoBERTa byte-level BPE tokenizer from vocab and merges"
+        );
+        Ok(Self::from_hf_backend(roberta::roberta_bpe_tokenizer(
+            vocab, merges, options,
         )?))
     }
 

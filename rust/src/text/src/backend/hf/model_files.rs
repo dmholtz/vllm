@@ -10,10 +10,11 @@ use hf_hub::{Cache, Repo, RepoType};
 use serde::Serialize;
 use thiserror_ext::AsReport as _;
 
-use vllm_tokenizer::BertWordPieceOptions;
+use vllm_tokenizer::{BertWordPieceOptions, RobertaBpeOptions};
 
 use super::HfOverrides;
 use super::config::{HfTokenizerConfig, load_model_config, load_tokenizer_config};
+use super::roberta::{roberta_bpe_options, uses_roberta_bpe};
 use super::wordpiece::{bert_wordpiece_options, uses_bert_wordpiece};
 use crate::error::{Error, Result};
 
@@ -41,13 +42,23 @@ pub enum TokenizerSource {
         vocab: PathBuf,
         options: BertWordPieceOptions,
     },
+    /// Paths to `vocab.json` and `merges.txt` of a RoBERTa-family checkpoint
+    /// without `tokenizer.json`.
+    ///
+    /// The tokenizer is built like transformers' `RobertaTokenizer.__init__`,
+    /// which the Python frontend uses for these checkpoints.
+    RobertaBpe {
+        vocab: PathBuf,
+        merges: PathBuf,
+        options: RobertaBpeOptions,
+    },
 }
 
 impl TokenizerSource {
     pub fn path(&self) -> &Path {
         match self {
             Self::HuggingFace(path) | Self::Tiktoken(path) | Self::Tekken(path) => path,
-            Self::BertWordPiece { vocab, .. } => vocab,
+            Self::BertWordPiece { vocab, .. } | Self::RobertaBpe { vocab, .. } => vocab,
         }
     }
 }
@@ -295,7 +306,10 @@ impl SourceFiles {
     async fn contains(&self, required: RequiredFile) -> Result<bool> {
         Ok(match required {
             RequiredFile::Tokenizer => {
-                self.tokenizer_file().await?.is_some() || self.get(BERT_VOCAB).await?.is_some()
+                self.tokenizer_file().await?.is_some()
+                    || self.get(BERT_VOCAB).await?.is_some()
+                    || (self.get(ROBERTA_VOCAB).await?.is_some()
+                        && self.get(ROBERTA_MERGES).await?.is_some())
             }
             RequiredFile::Config => self.get("config.json").await?.is_some(),
             RequiredFile::Nothing => true,
@@ -323,7 +337,8 @@ impl SourceFiles {
     }
 
     /// Select the tokenizer source from the files found by [`Self::tokenizer_file`],
-    /// falling back to the `vocab.txt` of a BERT-family checkpoint.
+    /// falling back to the `vocab.txt` of a BERT-family checkpoint or the
+    /// `vocab.json` and `merges.txt` of a RoBERTa-family one.
     async fn tokenizer(
         &self,
         tokenizer_config: &HfTokenizerConfig,
@@ -335,17 +350,20 @@ impl SourceFiles {
             {
                 return Ok(source);
             }
+            if let Some(source) = self.roberta_bpe(tokenizer_config, tokenizer_config_path).await? {
+                return Ok(source);
+            }
             return Err(Error::Tokenizer(match self {
                 Self::Dir(dir) => format!(
                     "local model directory '{}' does not contain a supported tokenizer file \
-                     (tokenizer.json, tiktoken.model, *.tiktoken, or vocab.txt of a BERT \
-                     tokenizer)",
+                     (tokenizer.json, tiktoken.model, *.tiktoken, vocab.txt of a BERT \
+                     tokenizer, or vocab.json and merges.txt of a RoBERTa tokenizer)",
                     dir.display()
                 ),
                 Self::Remote { model_id, .. } => format!(
                     "model '{model_id}' does not expose a supported tokenizer file \
-                     (tokenizer.json, tiktoken.model, *.tiktoken, or vocab.txt of a BERT \
-                     tokenizer) on Hugging Face"
+                     (tokenizer.json, tiktoken.model, *.tiktoken, vocab.txt of a BERT \
+                     tokenizer, or vocab.json and merges.txt of a RoBERTa tokenizer) on Hugging Face"
                 ),
             }));
         };
@@ -372,14 +390,11 @@ impl SourceFiles {
         let Some(vocab) = self.get(BERT_VOCAB).await? else {
             return Ok(None);
         };
-        let model_config = match tokenizer_config.tokenizer_class {
-            Some(_) => None,
-            None => Some(load_model_config(
-                self.get("config.json").await?.as_deref(),
-            )?),
-        };
-        let model_type = model_config.as_ref().and_then(|config| config.model_type());
-        if !uses_bert_wordpiece(tokenizer_config.tokenizer_class.as_deref(), model_type) {
+        let model_type = self.fallback_model_type(tokenizer_config).await?;
+        if !uses_bert_wordpiece(
+            tokenizer_config.tokenizer_class.as_deref(),
+            model_type.as_deref(),
+        ) {
             return Ok(None);
         }
         let options = bert_wordpiece_options(
@@ -388,6 +403,54 @@ impl SourceFiles {
             self.get("added_tokens.json").await?.as_deref(),
         )?;
         Ok(Some(TokenizerSource::BertWordPiece { vocab, options }))
+    }
+
+    /// The RoBERTa byte-level BPE tokenizer source, when this source has
+    /// `vocab.json` and `merges.txt` and transformers would build a
+    /// `RobertaTokenizer` for it (selected like [`Self::bert_wordpiece`]).
+    async fn roberta_bpe(
+        &self,
+        tokenizer_config: &HfTokenizerConfig,
+        tokenizer_config_path: Option<&Path>,
+    ) -> Result<Option<TokenizerSource>> {
+        let (Some(vocab), Some(merges)) = (
+            self.get(ROBERTA_VOCAB).await?,
+            self.get(ROBERTA_MERGES).await?,
+        ) else {
+            return Ok(None);
+        };
+        let model_type = self.fallback_model_type(tokenizer_config).await?;
+        if !uses_roberta_bpe(
+            tokenizer_config.tokenizer_class.as_deref(),
+            model_type.as_deref(),
+        ) {
+            return Ok(None);
+        }
+        let options = roberta_bpe_options(
+            tokenizer_config_path,
+            self.get("special_tokens_map.json").await?.as_deref(),
+            self.get("added_tokens.json").await?.as_deref(),
+        )?;
+        Ok(Some(TokenizerSource::RobertaBpe {
+            vocab,
+            merges,
+            options,
+        }))
+    }
+
+    /// The `model_type` that selects a tokenizer built from vocab files when
+    /// `tokenizer_config.json` names no `tokenizer_class`: the one of this
+    /// source's own `config.json` (`AutoTokenizer` reads the config of the path
+    /// it loads from).
+    async fn fallback_model_type(
+        &self,
+        tokenizer_config: &HfTokenizerConfig,
+    ) -> Result<Option<String>> {
+        if tokenizer_config.tokenizer_class.is_some() {
+            return Ok(None);
+        }
+        let config = load_model_config(self.get("config.json").await?.as_deref())?;
+        Ok(config.model_type().map(str::to_string))
     }
 
     /// Find the dedicated chat template file, if any.
@@ -408,6 +471,11 @@ impl SourceFiles {
 
 /// Vocabulary of a BERT WordPiece tokenizer (see [`TokenizerSource::BertWordPiece`]).
 const BERT_VOCAB: &str = "vocab.txt";
+
+/// Vocabulary and merges of a RoBERTa byte-level BPE tokenizer (see
+/// [`TokenizerSource::RobertaBpe`]).
+const ROBERTA_VOCAB: &str = "vocab.json";
+const ROBERTA_MERGES: &str = "merges.txt";
 
 /// Locate the cached snapshot directory of `repo` at its revision.
 fn cached_snapshot_dir(cache: &Cache, repo: &Repo) -> Option<PathBuf> {
@@ -630,6 +698,51 @@ mod tests {
         let error = ResolvedModelFiles::new(dir.path().to_str().unwrap(), None).await.unwrap_err();
         assert!(
             format!("{error:?}").contains("vocab.txt of a BERT tokenizer"),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn roberta_checkpoint_without_tokenizer_json_uses_its_vocab_and_merges() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("vocab.json"),
+            r#"{"<s>":0,"<pad>":1,"</s>":2,"<unk>":3,"<mask>":4}"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("merges.txt"), "#version: 0.2\n").unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type":"roberta"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"add_prefix_space":true}"#,
+        )
+        .unwrap();
+
+        let files = ResolvedModelFiles::new(dir.path().to_str().unwrap(), None).await.unwrap();
+        let TokenizerSource::RobertaBpe {
+            vocab,
+            merges,
+            options,
+        } = &files.tokenizer
+        else {
+            panic!(
+                "expected a RoBERTa byte-level BPE tokenizer, got {:?}",
+                files.tokenizer
+            );
+        };
+        assert_eq!(vocab, &dir.path().join("vocab.json"));
+        assert_eq!(merges, &dir.path().join("merges.txt"));
+        assert!(options.add_prefix_space);
+
+        // Without a RoBERTa class or model type the files are not a tokenizer.
+        fs::write(dir.path().join("config.json"), r#"{"model_type":"gpt2"}"#).unwrap();
+        let error = ResolvedModelFiles::new(dir.path().to_str().unwrap(), None).await.unwrap_err();
+        assert!(
+            format!("{error:?}").contains("vocab.json and merges.txt of a RoBERTa tokenizer"),
             "{error:?}"
         );
     }

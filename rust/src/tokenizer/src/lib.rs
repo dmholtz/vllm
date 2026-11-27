@@ -16,7 +16,7 @@ pub mod test_utils;
 mod tiktoken;
 
 pub use error::{Result, TokenizerError};
-pub use hf::{BertWordPieceOptions, HuggingFaceTokenizer};
+pub use hf::{BertWordPieceOptions, HuggingFaceTokenizer, RobertaBpeOptions, RobertaSpecialToken};
 pub use incremental::{DecodedText, IncrementalDecoder, TokenAnchor, TokenAttribution};
 pub use tekken::TekkenTokenizer;
 pub use tiktoken::TiktokenTokenizer;

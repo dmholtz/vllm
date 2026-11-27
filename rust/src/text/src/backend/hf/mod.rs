@@ -4,6 +4,7 @@
 mod config;
 mod model_files;
 mod overrides;
+mod roberta;
 mod wordpiece;
 
 use std::collections::BTreeSet;
@@ -32,6 +33,13 @@ fn load_tokenizer(tokenizer: &TokenizerSource) -> Result<DynTokenizer> {
         TokenizerSource::BertWordPiece { vocab, options } => Ok(Arc::new(
             HuggingFaceTokenizer::from_bert_vocab(vocab, options)?,
         )),
+        TokenizerSource::RobertaBpe {
+            vocab,
+            merges,
+            options,
+        } => Ok(Arc::new(HuggingFaceTokenizer::from_roberta_vocab(
+            vocab, merges, options,
+        )?)),
     }
 }
 
